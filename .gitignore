@@ -1,0 +1,38 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE and editor settings
+.idea/
+.vscode/
+
+# # Local runtime output
+log/
+# logs/
+# *.log
+
+# Matplotlib cache/config created locally
+.matplotlib/
+.matplotlib-cache/
+.mplconfig/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+__pycache__/calcUtils.cpython-312.pyc
+.mplconfig/fontlist-v310.json
