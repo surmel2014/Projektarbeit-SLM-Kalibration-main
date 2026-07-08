@@ -918,6 +918,7 @@ class Server:
 
             data = {
                 "S": (Sx, Sy),
+                "slm_pitch": slm_pitch,
                 "u0": u0,
                 "v0": v0,
                 "roi": np.asarray(roi),
@@ -1262,11 +1263,16 @@ def playground():
     
     Q, P = data["gx"].shape
     S = data["S"]
+    slm_pitch = data.get("slm_pitch", 8e-6)
     gx_raw, gy_raw = calcUtils.patch_gradients_to_maps(data["gradients"],P,Q,S)
-    curlRaw = calcUtils.curl_2d(data["gradients"][...,0], data["gradients"][...,1], S*8e-6)
+
+    Sx, Sy = calcUtils._normalize_patch_size(S, "S")
+    x_pitch, y_pitch = calcUtils._normalize_pixel_pitch(slm_pitch, "slm_pitch")
+    patch_dx = (Sx * x_pitch, Sy * y_pitch)
+    curlRaw = calcUtils.curl_2d(data["gradients"][...,0], data["gradients"][...,1], patch_dx)
     plotUtils.plot_camImg(curlRaw, title="Curl patch Gradients")
     
-    phi_interp, _ = calcUtils.reconstruct_phase_from_patch_gradients(data["gradients"], P, Q, S, 8e-6, "linear")
+    phi_interp, _ = calcUtils.reconstruct_phase_from_patch_gradients(data["gradients"], P, Q, S, slm_pitch, "linear")
     np.save("log/wavefrontmap_pt3.npy", phi_interp)
     #phi_raw = calcUtils.poisson_reconstruct_phase_direct_Fourier_Integration(gx_raw, gy_raw, S*8e-6)
     plotUtils.plot_phase_gradient(phi_interp,gx_raw, gy_raw, title="Phase from Patches")
@@ -1280,14 +1286,14 @@ def playground():
     resolution = data["phase"].shape
     
     # phaseDFI = calcUtils.poisson_reconstruct_phase_direct_Fourier_Integration(gx, gy, 8e-6)
-    phaseDFI = calcUtils.poisson_reconstruct_phase(gx,gy, 8e-6, 300)
-    gxDFI, gyDFI= calcUtils.phaseMaskToGradients(phaseDFI, 8e-6)
+    phaseDFI = calcUtils.poisson_reconstruct_phase(gx,gy, slm_pitch, 300)
+    gxDFI, gyDFI= calcUtils.phaseMaskToGradients(phaseDFI, slm_pitch)
     g = np.sqrt(gx**2+gy**2)
     gDFI = np.sqrt(gxDFI**2+gyDFI**2)
     mse = np.mean((g-gDFI)**2)
     
-    print(f"Curl gy gy: {calcUtils.curl_2d(gx,gy,8e-6)} ")
-    print(f"Curl gyDFI gyDFI: {calcUtils.curl_2d(gxDFI,gyDFI,8e-6)} ")
+    print(f"Curl gy gy: {calcUtils.curl_2d(gx,gy,slm_pitch)} ")
+    print(f"Curl gyDFI gyDFI: {calcUtils.curl_2d(gxDFI,gyDFI,slm_pitch)} ")
     
      
     print(f"MSE DFI: {mse}")

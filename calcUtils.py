@@ -736,8 +736,12 @@ def gradient_maps_from_com_deviation(
         raise ValueError("wavelength must be greater than 0.")
     if cam_pitch <= 0:
         raise ValueError("cam_pitch must be greater than 0.")
-    if P <= 0 or Q <= 0 or S <= 0:
-        raise ValueError("P, Q, and S must be greater than 0.")
+    if P <= 0 or Q <= 0:
+        raise ValueError("P and Q must be greater than 0.")
+
+    Sx, Sy = _normalize_patch_size(S, "S")
+    if Sx <= 0 or Sy <= 0:
+        raise ValueError("S must contain positive patch sizes.")
 
     px_to_freq = cam_pitch / (focal_length * wavelength)
     gradients_patch = sign * 2 * np.pi * (com_patch - com_ref) * px_to_freq
@@ -934,8 +938,9 @@ def reconstruct_phase_from_patch_gradients(
     N, M = gx_patch.shape
 
     # Abstand zwischen zwei Patchzentren
+    Sx, Sy = _normalize_patch_size(S, "S")
     x_pitch, y_pitch = _normalize_pixel_pitch(slm_pitch, "slm_pitch")
-    dx_patch = (S * x_pitch, S * y_pitch)
+    dx_patch = (Sx * x_pitch, Sy * y_pitch)
 
     # Phase auf Patch-Gitter rekonstruieren
     phi_patch = poisson_reconstruct_phase_direct_Fourier_Integration(
@@ -950,8 +955,8 @@ def reconstruct_phase_from_patch_gradients(
     # Koordinaten der Patchzentren
     # --------------------------------------------------
 
-    patch_x = (np.arange(M) + 0.5) * S
-    patch_y = (np.arange(N) + 0.5) * S
+    patch_x = (np.arange(M) + 0.5) * Sx
+    patch_y = (np.arange(N) + 0.5) * Sy
 
     interpolator = RegularGridInterpolator(
         (patch_y, patch_x),
@@ -990,16 +995,17 @@ def curl_2d(gx, gy, dx):
     ----------
     gx, gy : 2D ndarray
         Komponenten des Vektorfelds.
-    dx : float
-        Gitterabstand (für x und y gleich angenommen).
+    dx : float or tuple
+        Gitterabstand für x und y. Kann ein Skalar oder ein (dx_x, dx_y)-Tuple sein.
 
     Returns
     -------
     curl : 2D ndarray
         z-Komponente des Curls.
     """
-    dgy_dy, dgy_dx = np.gradient(gy, dx, dx)
-    dgx_dy, dgx_dx = np.gradient(gx, dx, dx)
+    dx_x, dx_y = _normalize_pixel_pitch(dx, "dx")
+    dgy_dy, dgy_dx = np.gradient(gy, dx_y, dx_x)
+    dgx_dy, dgx_dx = np.gradient(gx, dx_y, dx_x)
 
     return dgy_dx - dgx_dy
 
