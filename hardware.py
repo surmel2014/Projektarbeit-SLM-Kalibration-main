@@ -44,15 +44,20 @@ class SLM:
 
         elif display_type == "pt3":
             self.resolution = (1440, 7680)
-            self.display_width = self.resolution[1] 
-            self.display_height = self.resolution[0] 
-            self.pitch = 25e-6  # y 75µ 
+            self.display_width = self.resolution[1]
+            self.display_height = self.resolution[0]
+            self.pitch = (25e-6, 75e-6)  # x=25µm, y=75µm
             self.cluster = Communication_Class(ip_port = "192.168.240.131:3456")#localhost:50051")
-
 
         else:
             self.resolution = resolution
-            self.pitch = 10e-6  #meters
+            self.pitch = pitch
+
+        if not np.isscalar(self.pitch):
+            self.pitch = tuple(self.pitch)
+            if len(self.pitch) != 2:
+                raise ValueError("pitch must be a scalar or a two-value tuple.")
+            self.pitch = (float(self.pitch[0]), float(self.pitch[1]))
         self.isSimulative = isSimulative
 
         self.laserWavelength = waveLength

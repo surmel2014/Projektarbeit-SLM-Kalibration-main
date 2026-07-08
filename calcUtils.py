@@ -33,6 +33,41 @@ def _coordinate_grid(resolution, center=None):
     return x - x0, y - y0
 
 
+def _normalize_pixel_pitch(pixelPitch, name="pixelPitch"):
+    if np.isscalar(pixelPitch):
+        x_pitch = y_pitch = float(pixelPitch)
+    else:
+        pixelPitch = tuple(pixelPitch)
+        if len(pixelPitch) != 2:
+            raise ValueError(f"{name} must be a scalar or a two-value tuple.")
+        x_pitch = float(pixelPitch[0])
+        y_pitch = float(pixelPitch[1])
+
+    if x_pitch <= 0 or y_pitch <= 0:
+        raise ValueError(f"{name} values must be greater than 0.")
+
+    return x_pitch, y_pitch
+
+
+def _normalize_patch_size(S, name="S"):
+    """Return a patch size as (Sx, Sy) in pixels."""
+    if np.isscalar(S):
+        Sx = Sy = int(S)
+    else:
+        try:
+            S = tuple(S)
+        except TypeError as exc:
+            raise ValueError(f"{name} must be a scalar or a two-value tuple.") from exc
+        if len(S) != 2:
+            raise ValueError(f"{name} must be a scalar or a two-value tuple.")
+        Sx, Sy = int(S[0]), int(S[1])
+
+    if Sx <= 0 or Sy <= 0:
+        raise ValueError(f"{name} values must be greater than 0.")
+
+    return Sx, Sy
+
+
 def axiconPhase(resolution, axiconAngle=1.0, center=None, wavelength=532e-9, pixelPitch=10e-6):
     """Create a wrapped conical axicon phase map for an SLM.
 
@@ -41,11 +76,10 @@ def axiconPhase(resolution, axiconAngle=1.0, center=None, wavelength=532e-9, pix
     """
     if wavelength <= 0:
         raise ValueError("wavelength must be greater than 0.")
-    if pixelPitch <= 0:
-        raise ValueError("pixelPitch must be greater than 0.")
+    x_pitch, y_pitch = _normalize_pixel_pitch(pixelPitch, "pixelPitch")
 
     x, y = _coordinate_grid(resolution, center)
-    radius_m = np.hypot(x, y) * pixelPitch
+    radius_m = np.hypot(x * x_pitch, y * y_pitch)
     angle_rad = np.deg2rad(axiconAngle)
     phase = (2 * np.pi / wavelength) * np.sin(angle_rad) * radius_m
     return np.mod(phase, 2 * np.pi)
@@ -96,11 +130,10 @@ def getGaussianBeam(
         raise ValueError("waistDiameter must be greater than 0.")
     if wavelength <= 0:
         raise ValueError("wavelength must be greater than 0.")
-    if pixelPitch <= 0:
-        raise ValueError("pixelPitch must be greater than 0.")
+    x_pitch, y_pitch = _normalize_pixel_pitch(pixelPitch, "pixelPitch")
 
     x, y = _coordinate_grid(resolution, center)
-    radius_squared = (x * pixelPitch) ** 2 + (y * pixelPitch) ** 2
+    radius_squared = (x * x_pitch) ** 2 + (y * y_pitch) ** 2
 
     waist_radius = waistDiameter / 2.0
     axial_distance = z - waistPosition
@@ -309,15 +342,7 @@ def phaseMaskToGradients(phaseMask, pixelPitch=1.0, unwrap=True):
     if not np.all(np.isfinite(phase)):
         raise ValueError("phaseMask contains NaN or infinite values.")
 
-    if np.isscalar(pixelPitch):
-        dx = dy = float(pixelPitch)
-    else:
-        dx, dy = pixelPitch
-        dx = float(dx)
-        dy = float(dy)
-
-    if dx <= 0 or dy <= 0:
-        raise ValueError("pixelPitch values must be greater than 0.")
+    dx, dy = _normalize_pixel_pitch(pixelPitch, "pixelPitch")
 
     if unwrap:
         phase = np.unwrap(np.unwrap(phase, axis=1), axis=0)
@@ -352,15 +377,7 @@ def sphericalPhaseTestMap(
     if radiusOfCurvature == 0:
         raise ValueError("radiusOfCurvature must not be 0.")
 
-    if np.isscalar(pixelPitch):
-        dx = dy = float(pixelPitch)
-    else:
-        dx, dy = pixelPitch
-        dx = float(dx)
-        dy = float(dy)
-
-    if dx <= 0 or dy <= 0:
-        raise ValueError("pixelPitch values must be greater than 0.")
+    dx, dy = _normalize_pixel_pitch(pixelPitch, "pixelPitch")
 
     x_px, y_px = _coordinate_grid(resolution, center)
     x = x_px * dx
@@ -389,20 +406,23 @@ def sphericalPhaseTestMap(
 def make_patch_ramp(P, Q, S, m, n, u_eff, v_eff, slm_pitch):
     """
     P,Q: SLM-Größe in Pixeln
-    S: Patchgröße in Pixeln
+    S: Patchgröße in Pixeln. Scalar (Sx=Sy=S) or (Sx, Sy).
     m,n: Patchindex
     u_eff,v_eff: effektive Deflektorfrequenz [1/m]
     slm_pitch: SLM-Pixelpitch [m]
     """
+    Sx, Sy = _normalize_patch_size(S, "S")
+
     phase = np.zeros((Q, P), dtype=np.float32)
     amp = np.zeros((Q, P), dtype=np.float32)
 
-    x0, x1 = m * S, (m + 1) * S
-    y0, y1 = n * S, (n + 1) * S
+    x0, x1 = m * Sx, (m + 1) * Sx
+    y0, y1 = n * Sy, (n + 1) * Sy
 
     # Koordinaten relativ zum Patchzentrum, in Metern
-    xs = (np.arange(x0, x1) - (x0 + x1 - 1) / 2) * slm_pitch
-    ys = (np.arange(y0, y1) - (y0 + y1 - 1) / 2) * slm_pitch
+    x_pitch, y_pitch = _normalize_pixel_pitch(slm_pitch, "slm_pitch")
+    xs = (np.arange(x0, x1) - (x0 + x1 - 1) / 2) * x_pitch
+    ys = (np.arange(y0, y1) - (y0 + y1 - 1) / 2) * y_pitch
     X, Y = np.meshgrid(xs, ys)
 
     phase[y0:y1, x0:x1] = 2 * np.pi * (X * u_eff + Y * v_eff)
@@ -415,11 +435,10 @@ def make_full_display_patch(resolution, u0, v0, slm_pitch):
     Q, P = resolution
     if Q <= 0 or P <= 0:
         raise ValueError("resolution values must be greater than 0.")
-    if slm_pitch <= 0:
-        raise ValueError("slm_pitch must be greater than 0.")
+    x_pitch, y_pitch = _normalize_pixel_pitch(slm_pitch, "slm_pitch")
 
-    xs = (np.arange(P) - (P - 1) / 2) * slm_pitch
-    ys = (np.arange(Q) - (Q - 1) / 2) * slm_pitch
+    xs = (np.arange(P) - (P - 1) / 2) * x_pitch
+    ys = (np.arange(Q) - (Q - 1) / 2) * y_pitch
     X, Y = np.meshgrid(xs, ys)
 
     phase = 2 * np.pi * (X * u0 + Y * v0)
@@ -440,17 +459,15 @@ def make_patch_mosaic_mask(best_alphas, best_betas, S, slm_pitch, u0=0.0, v0=0.0
         raise ValueError("best_alphas and best_betas must have the same shape.")
     if best_alphas.ndim != 2:
         raise ValueError("best_alphas and best_betas must be 2D arrays.")
-    if S <= 0:
-        raise ValueError("S must be greater than 0.")
-    if slm_pitch <= 0:
-        raise ValueError("slm_pitch must be greater than 0.")
+    Sx, Sy = _normalize_patch_size(S, "S")
+    _normalize_pixel_pitch(slm_pitch, "slm_pitch")
 
     N, M = best_alphas.shape
     if resolution is None:
-        Q, P = N * S, M * S
+        Q, P = N * Sy, M * Sx
     else:
         Q, P = resolution
-        if Q < N * S or P < M * S:
+        if Q < N * Sy or P < M * Sx:
             raise ValueError("resolution is too small for the patch arrays and patch size.")
 
     mask = np.zeros((Q, P), dtype=np.float32)
@@ -459,10 +476,103 @@ def make_patch_mosaic_mask(best_alphas, best_betas, S, slm_pitch, u0=0.0, v0=0.0
         for m in range(M):
             alpha = 0.0 if np.isnan(best_alphas[n, m]) else best_alphas[n, m]
             beta = 0.0 if np.isnan(best_betas[n, m]) else best_betas[n, m]
-            patch,_ = make_patch_ramp(P, Q, S, m, n, u0 - alpha, v0 - beta, slm_pitch)
+            patch,_ = make_patch_ramp(P, Q, (Sx, Sy), m, n, u0 - alpha, v0 - beta, slm_pitch)
             mask += patch
 
     return wrap_phase(mask)
+
+
+def compute_patch_size_for_physical_square(
+    resolution,
+    slm_pitch,
+    prefer_larger=True,
+    max_patches_x=None,
+    max_patches_y=None,
+):
+    """
+    Bestimme eine geeignete Patchgröße in Pixeln so dass Patches physikalisch
+    annähernd quadratisch sind.
+
+    - `resolution` ist ein (Q, P)-Tupel (rows, cols) im Pixelraum.
+    - `slm_pitch` kann ein Skalar oder ein (x_pitch, y_pitch)-Tuple in Metern sein.
+    - `max_patches_x` / `max_patches_y` begrenzen die maximale Anzahl von
+      Patches pro Achse, damit es nicht zu viele werden.
+    - Rückgabe: dict mit Feldern `Sx`, `Sy` (Patchgröße in Pixeln für x/y),
+      `num_patches_x`, `num_patches_y`, `physical_aspect_ratio` (physischer
+      Seitenverhältnis der Patchgröße in Metern, also `(Sx*x_pitch)/(Sy*y_pitch)`),
+      und `S_common` als gemeinsamer Divisor (gcd) von Sx und Sy.
+
+    Algorithmus: wir durchlaufen alle Teiler von P bzw. Q (Patchgrößen in
+    Pixeln), wählen das Paar (Sx,Sy) mit minimaler Differenz der physikalischen
+    Kantenlängen |Sx*x_pitch - Sy*y_pitch|. Bei Gleichstand kann `prefer_larger`
+    größere Patches bevorzugen. Wenn `max_patches_x` bzw. `max_patches_y`
+    gesetzt sind, werden nur Kandidaten akzeptiert, die nicht mehr als diese
+    Anzahl von Patches pro Achse erzeugen.
+    """
+    import math
+
+    Q, P = resolution
+    x_pitch, y_pitch = _normalize_pixel_pitch(slm_pitch, "slm_pitch")
+
+    def divisors(n):
+        small = []
+        large = []
+        i = 1
+        while i * i <= n:
+            if n % i == 0:
+                small.append(i)
+                if i != n // i:
+                    large.append(n // i)
+            i += 1
+        return small + large[::-1]
+
+    divP = divisors(P)
+    divQ = divisors(Q)
+
+    best = None
+    best_pair = (1, 1)
+
+    for Sx in divP:
+        num_patches_x = P // Sx
+        if max_patches_x is not None and num_patches_x > max_patches_x:
+            continue
+
+        phys_x = Sx * x_pitch
+        for Sy in divQ:
+            num_patches_y = Q // Sy
+            if max_patches_y is not None and num_patches_y > max_patches_y:
+                continue
+
+            phys_y = Sy * y_pitch
+            diff = abs(phys_x - phys_y)
+            if best is None:
+                best = diff
+                best_pair = (Sx, Sy)
+            else:
+                if diff < best - 1e-18:
+                    best = diff
+                    best_pair = (Sx, Sy)
+                elif abs(diff - best) <= 1e-18 and prefer_larger:
+                    # prefer larger physical area
+                    area_curr = Sx * Sy * x_pitch * y_pitch
+                    area_best = best_pair[0] * best_pair[1] * x_pitch * y_pitch
+                    if area_curr > area_best:
+                        best_pair = (Sx, Sy)
+
+    Sx, Sy = best_pair
+    S_common = math.gcd(Sx, Sy)
+    num_patches_x = P // Sx
+    num_patches_y = Q // Sy
+    physical_aspect_ratio = (Sx * x_pitch) / (Sy * y_pitch)
+
+    return {
+        "Sx": int(Sx),
+        "Sy": int(Sy),
+        "num_patches_x": int(num_patches_x),
+        "num_patches_y": int(num_patches_y),
+        "physical_aspect_ratio": float(physical_aspect_ratio),
+        "S_common": int(S_common),
+    }
 
 
 def spot_com_and_power(image, roi):
@@ -491,9 +601,10 @@ def spot_com_and_power(image, roi):
 
 def interpolate_patch_values(values, P, Q, S, kind="linear"):
     N, M = values.shape
+    Sx, Sy = _normalize_patch_size(S, "S")
 
-    patch_x = (np.arange(M) + 0.5) * S
-    patch_y = (np.arange(N) + 0.5) * S
+    patch_x = (np.arange(M) + 0.5) * Sx
+    patch_y = (np.arange(N) + 0.5) * Sy
 
     k = 3 if kind == "cubic" else 1
     spline = RectBivariateSpline(patch_y, patch_x, values, kx=k, ky=k)
@@ -522,12 +633,11 @@ def patch_gradients_to_maps(gradients, P, Q, S=None, remove_mean=False):
         raise ValueError("gradients must contain at least one patch.")
 
     if S is not None:
-        if S <= 0:
-            raise ValueError("S must be greater than 0.")
-        if N * S > Q or M * S > P:
+        Sx, Sy = _normalize_patch_size(S, "S")
+        if N * Sy > Q or M * Sx > P:
             raise ValueError("S is too large for the requested SLM resolution.")
-        y_edges = np.arange(N + 1) * S
-        x_edges = np.arange(M + 1) * S
+        y_edges = np.arange(N + 1) * Sy
+        x_edges = np.arange(M + 1) * Sx
         y_edges[-1] = Q
         x_edges[-1] = P
     else:
@@ -675,8 +785,9 @@ def reconstruct_phase_from_gradients(gx, gy, dx):
     Gx = fft2(gx)
     Gy = fft2(gy)
 
-    fx = fftfreq(P, d=dx)
-    fy = fftfreq(Q, d=dx)
+    dx_x, dx_y = _normalize_pixel_pitch(dx, "dx")
+    fx = fftfreq(P, d=dx_x)
+    fy = fftfreq(Q, d=dx_y)
     U, V = np.meshgrid(fx, fy)
 
     denom = (2*np.pi)**2 * (U**2 + V**2)
@@ -697,7 +808,7 @@ def find_peak_and_threshold(img):
 def poisson_reconstruct_phase(gx, gy, dx, pad_width=None, pad_mode="edge"):
     """
     Löst ∇² phi = div(g) im Fourier-Raum.
-    gx, gy in rad/m; dx = SLM-Pixelpitch in m.
+    gx, gy in rad/m; dx = SLM-Pixelpitch in m, scalar or (xPitch, yPitch).
 
     The gradient fields are padded before the FFT solve and cropped back to the
     original shape afterwards. This reduces edge artifacts from the periodic
@@ -709,8 +820,8 @@ def poisson_reconstruct_phase(gx, gy, dx, pad_width=None, pad_mode="edge"):
         raise ValueError("gx and gy must have the same shape.")
     if gx.ndim != 2:
         raise ValueError(f"Expected 2D gradient fields, got shape {gx.shape}.")
-    if dx <= 0:
-        raise ValueError("dx must be greater than 0.")
+
+    dx_x, dx_y = _normalize_pixel_pitch(dx, "dx")
     if not np.all(np.isfinite(gx)) or not np.all(np.isfinite(gy)):
         raise ValueError("gx and gy must contain only finite values.")
 
@@ -721,14 +832,14 @@ def poisson_reconstruct_phase(gx, gy, dx, pad_width=None, pad_mode="edge"):
 
     Q, P = gx_padded.shape
 
-    dgx_dx = np.gradient(gx_padded, dx, axis=1)
-    dgy_dy = np.gradient(gy_padded, dx, axis=0)
+    dgx_dx = np.gradient(gx_padded, dx_x, axis=1)
+    dgy_dy = np.gradient(gy_padded, dx_y, axis=0)
     div_g = dgx_dx + dgy_dy
 
     F_div = fft2(div_g)
 
-    fx = fftfreq(P, d=dx)
-    fy = fftfreq(Q, d=dx)
+    fx = fftfreq(P, d=dx_x)
+    fy = fftfreq(Q, d=dx_y)
     U, V = np.meshgrid(fx, fy)
 
     denom = (2 * np.pi) ** 2 * (U**2 + V**2)
@@ -748,8 +859,9 @@ def poisson_reconstruct_phase_direct_Fourier_Integration(gx, gy, dx):
     Gx = fft2(gx)
     Gy = fft2(gy)
 
-    fx = fftfreq(P, d=dx)
-    fy = fftfreq(Q, d=dx)
+    dx_x, dx_y = _normalize_pixel_pitch(dx, "dx")
+    fx = fftfreq(P, d=dx_x)
+    fy = fftfreq(Q, d=dx_y)
     U, V = np.meshgrid(fx, fy)
 
     denom = (2*np.pi)**2 * (U**2 + V**2)
@@ -822,7 +934,8 @@ def reconstruct_phase_from_patch_gradients(
     N, M = gx_patch.shape
 
     # Abstand zwischen zwei Patchzentren
-    dx_patch = S * slm_pitch
+    x_pitch, y_pitch = _normalize_pixel_pitch(slm_pitch, "slm_pitch")
+    dx_patch = (S * x_pitch, S * y_pitch)
 
     # Phase auf Patch-Gitter rekonstruieren
     phi_patch = poisson_reconstruct_phase_direct_Fourier_Integration(
@@ -1143,10 +1256,22 @@ def getTimestamp():
 if __name__ == "__main__": 
     
     resolution = (1080, 1920)
+    # Beispielaufruf: berechne Patchgrößen für pt3 (asymmetrischer Pitch)
+    pt3_resolution = (1440, 7680)
+    pt3_pitch = (25e-6, 75e-6)
+    sizes_pt3 = compute_patch_size_for_physical_square(pt3_resolution, pt3_pitch, max_patches_y=5, max_patches_x=15)
+    print(f"pt3 patch suggestion: {sizes_pt3}")
+    print(f"pt3 physical aspect ratio: {sizes_pt3['physical_aspect_ratio']:.3f}")
     
     # _, phase, _ = periodic_gs_multispot_slm(resolution)
     
-    data = loadNpz()
+    try:
+        data = loadNpz()
+    except FileNotFoundError:
+        print("No .npz calibration file found; skipping downstream demo plotting.")
+        plt.close("all")
+        raise SystemExit(0)
+
     resolution = data["phase"].shape
     S = np.gcd(resolution[0], resolution[1])
     mosaic_mask = make_patch_mosaic_mask(data["best_alphas"], data["best_betas"], S, 8e-6, data["u0"], data["v0"], resolution=resolution)

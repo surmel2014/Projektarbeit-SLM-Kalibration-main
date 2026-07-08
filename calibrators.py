@@ -279,10 +279,21 @@ class Server:
         holo = self.SLM.currentHolo   
         
         field = gaussianBeam*np.exp(1j*holo)
-        
-        propField, xFocal, yFocal = calcUtils.propagateField(field, self.SLM.pitch, self.SLM.pitch, 
-                                                             self.waveLength, focalLength=0.1, outputPitch=1e-6,
-                                                             outputResolution=(256,256))
+        slm_pitch = self.SLM.pitch
+        if np.isscalar(slm_pitch):
+            x_pitch = y_pitch = float(slm_pitch)
+        else:
+            x_pitch, y_pitch = slm_pitch
+
+        propField, xFocal, yFocal = calcUtils.propagateField(
+            field,
+            x_pitch,
+            y_pitch,
+            self.waveLength,
+            focalLength=0.1,
+            outputPitch=1e-6,
+            outputResolution=(256, 256),
+        )
         print(f"focal Pitch is {xFocal[1]-xFocal[0]}")
         intensity = np.abs(propField)**2
         
@@ -303,14 +314,14 @@ class Server:
         if hasattr(self, "CAM"):
             self.CAM.nFrames = 1
 
-      
-
         slm_pitch = self.SLM.pitch
-      
+        if np.isscalar(slm_pitch):
+            x_pitch = y_pitch = float(slm_pitch)
+        else:
+            x_pitch, y_pitch = slm_pitch
 
-        u0 = 0.1 / slm_pitch
-       
-        v0 = -0.1 / slm_pitch
+        u0 = 0.1 / x_pitch
+        v0 = -0.1 / y_pitch
 
         M = P // S
         N = Q // S
@@ -397,15 +408,19 @@ class Server:
         roi = _normalize_roi(roi)
 
         slm_pitch = self.SLM.pitch
+        if np.isscalar(slm_pitch):
+            x_pitch = y_pitch = float(slm_pitch)
+        else:
+            x_pitch, y_pitch = slm_pitch
+
         live = None
         if live_view:
             live = LiveCalibrationView(roi=roi)
-        
 
         if u0 is None:
-            u0 = 2000 #-0.1 / slm_pitch
+            u0 = 2000 #-0.1 / x_pitch
         if v0 is None:
-            v0 = 0 #0.1 / slm_pitch
+            v0 = 0 #0.1 / y_pitch
 
         M = P // S
         N = Q // S
@@ -683,6 +698,8 @@ class Server:
         self,
         S="GCD",
         focal_length=0.06,
+        Sx=None,
+        Sy=None,
         u0=None,
         v0=None,
         roi=(500, 1500, 300, 1700),
@@ -769,18 +786,43 @@ class Server:
             roi = _normalize_roi(roi)
 
             slm_pitch = self.SLM.pitch
+            if np.isscalar(slm_pitch):
+                x_pitch = y_pitch = float(slm_pitch)
+            else:
+                x_pitch, y_pitch = slm_pitch
+
+            # Bestimme einmalig die Patchgröße so dass Patches physikalisch
+            # annähernd quadratisch sind. Wenn Sx/Sy nicht explizit übergeben
+            # werden, wird entweder S als scalar/tuple interpretiert oder die
+            # helper-Funktion verwendet.
+            if Sx is None and Sy is None:
+                if S == "GCD" or S is None:
+                    sizes = calcUtils.compute_patch_size_for_physical_square((Q, P), slm_pitch)
+                    Sx = sizes["Sx"]
+                    Sy = sizes["Sy"]
+                    print(f"Patch sizes: Sx={Sx}, Sy={Sy}")
+                else:
+                    Sx, Sy = calcUtils._normalize_patch_size(S, "S")
+            else:
+                if Sx is None or Sy is None:
+                    raise ValueError("Sx and Sy must both be provided together.")
+                Sx = int(Sx)
+                Sy = int(Sy)
+
+            if Sx <= 0 or Sy <= 0:
+                raise ValueError("Patch sizes must be greater than 0.")
 
             live = None
             if live_view:
                 live = LiveCalibrationView(roi=roi)
 
             if u0 is None:
-                u0 = 0.1 / slm_pitch
+                u0 = 0.1 / x_pitch
             if v0 is None:
-                v0 = -0.1 / slm_pitch
+                v0 = -0.1 / y_pitch
 
-            M = P // S
-            N = Q // S
+            M = P // Sx
+            N = Q // Sy
 
             # ------------------------------------------------------------
             # 0. Zeroth-order / Hintergrund aufnehmen
@@ -808,7 +850,8 @@ class Server:
             m_ref, n_ref = M // 2, N // 2
 
             phase_ref, amp_ref = calcUtils.make_patch_ramp(
-                P, Q, S,
+                P, Q,
+                (Sx, Sy),
                 m_ref, n_ref,
                 u0, v0,
                 slm_pitch,
@@ -825,7 +868,7 @@ class Server:
                         phase_ref,
                         img_ref,
                         "Wavefront calibration - reference patch",
-                        patch_center=((m_ref + 0.5) * S, (n_ref + 0.5) * S),
+                        patch_center=((m_ref + 0.5) * Sx, (n_ref + 0.5) * Sy),
                         roi=roi,
                     )
                     # roi = live.select_roi(img_ref.shape, roi)
@@ -849,7 +892,7 @@ class Server:
                             img_ref,
                             "Wavefront calibration - reference patch",
                             cam_com=com_ref,
-                            patch_center=((m_ref + 0.5) * S, (n_ref + 0.5) * S),
+                            patch_center=((m_ref + 0.5) * Sx, (n_ref + 0.5) * Sy),
                             cam_ref_com=com_ref,
                             roi=roi,
                         )
@@ -874,7 +917,7 @@ class Server:
             max_step = max_step_px * px_to_freq
 
             data = {
-                "S": S,
+                "S": (Sx, Sy),
                 "u0": u0,
                 "v0": v0,
                 "roi": np.asarray(roi),
@@ -894,7 +937,8 @@ class Server:
             # ------------------------------------------------------------
             def measure_patch(m, n, alpha_tilde, beta_tilde, title_suffix="", k=None):
                 phase, amp = calcUtils.make_patch_ramp(
-                    P, Q, S,
+                    P, Q,
+                    (Sx, Sy),
                     m, n,
                     u0 - alpha_tilde,
                     v0 - beta_tilde,
@@ -919,11 +963,8 @@ class Server:
                             img,
                             f"Wavefront calibration - patch ({m}, {n}) {title_suffix}",
                             cam_com=com,
-                            patch_center=((m + 0.5) * S, (n + 0.5) * S),
+                            patch_center=((m + 0.5) * Sx, (n + 0.5) * Sy),
                         )
-
-                if com is None:
-                    return None, None, None
 
                 delta_px = com - com_ref
                 return delta_px, power, com
@@ -1131,12 +1172,14 @@ class Server:
             # Alte Variante: Gradienten auf SLM-Gitter interpolieren
             gx_map = calcUtils.interpolate_patch_values(
                 gradients[..., 0],
-                P, Q, S,
+                P, Q,
+                (Sx, Sy),
                 kind="linear",
             )
             gy_map = calcUtils.interpolate_patch_values(
                 gradients[..., 1],
-                P, Q, S,
+                P, Q,
+                (Sx, Sy),
                 kind="linear",
             )
 
@@ -1173,11 +1216,13 @@ class Server:
 
                 
         slm_pitch = self.SLM.pitch
+        if np.isscalar(slm_pitch):
+            x_pitch = y_pitch = float(slm_pitch)
+        else:
+            x_pitch, y_pitch = slm_pitch
 
-        
-       
-        u0 = 0.1 / slm_pitch
-        v0 = 0.1 / slm_pitch
+        u0 = 0.1 / x_pitch
+        v0 = 0.1 / y_pitch
 
         M = P // S
         N = Q // S
