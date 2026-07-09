@@ -714,6 +714,7 @@ class Server:
         probe_px=20.0,
         max_step_px=300.0,
         damping=1,
+        useCorrection = False
         ):
         """
         Wavefront-Kalibration mit gemessener lokaler 2x2-Jacobi-Matrix.
@@ -759,8 +760,8 @@ class Server:
             return _limited_step(step, max_step)
 
         old_camera_frames = None
-
-        correctionPhase = np.load("log/wavefrontmap_pt3.npy")
+        if useCorrection:
+            correctionPhase = np.load("log/wavefrontmap_pt3.npy")
 
         Q, P = self.SLM.resolution
 
@@ -790,6 +791,7 @@ class Server:
                 x_pitch = y_pitch = float(slm_pitch)
             else:
                 x_pitch, y_pitch = slm_pitch
+                print(f"Pixels are asymmetric")
 
             # Bestimme einmalig die Patchgröße so dass Patches physikalisch
             # annähernd quadratisch sind. Wenn Sx/Sy nicht explizit übergeben
@@ -797,7 +799,7 @@ class Server:
             # helper-Funktion verwendet.
             if Sx is None and Sy is None:
                 if S == "GCD" or S is None:
-                    sizes = calcUtils.compute_patch_size_for_physical_square((Q, P), slm_pitch)
+                    sizes = calcUtils.compute_patch_size_for_physical_square((Q, P), slm_pitch, max_patches_x=10, max_patches_y=5)
                     Sx = sizes["Sx"]
                     Sy = sizes["Sy"]
                     print(f"Patch sizes: Sx={Sx}, Sy={Sy}")
@@ -836,6 +838,8 @@ class Server:
 
             thresh_zerothorder = self.getSettledCamImg(settle_s, discard_frames)
 
+            
+
             if live is not None:
                 live.update(
                     black,
@@ -843,7 +847,7 @@ class Server:
                     "Wavefront calibration - background",
                 )
                 roi = live.select_roi(thresh_zerothorder.shape, roi)
-
+            thresh_zerothorder = 0
             # ------------------------------------------------------------
             # 1. Referenzpatch
             # ------------------------------------------------------------
@@ -945,11 +949,13 @@ class Server:
                     v0 - beta_tilde,
                     slm_pitch,
                 )
-                #phase = (phase +correctionPhase)%(2*np.pi)
+                if useCorrection:
+                    phase = (phase +correctionPhase)%(2*np.pi)
                 # phase = server.mosaic * amp
                 self.showHologram(phase, amp)
                 
-                img = self.getSettledCamImg(settle_s, discard_frames) - thresh_zerothorder
+                img = self.getSettledCamImg(settle_s, discard_frames) 
+                img -= thresh_zerothorder
                 img = np.clip(img, 0, None)
                 com, power = calcUtils.spot_com_and_power(img, roi)
 
@@ -966,8 +972,10 @@ class Server:
                             cam_com=com,
                             patch_center=((m + 0.5) * Sx, (n + 0.5) * Sy),
                         )
-
-                delta_px = com - com_ref
+                if com is None: 
+                    delta_px = 0
+                else:
+                    delta_px = com - com_ref
                 return delta_px, power, com
 
             # ------------------------------------------------------------
@@ -1357,7 +1365,7 @@ def testCorrection():
     server = Server("pt3", False, False)
 
     correctionPhase = np.load("log/wavefrontmap_pt3.npy")
-    spie_phase = np.load("log/2Spots_phase.npy")
+    spie_phase = np.load("log/twoSpot_phase.npy")
 
     plt.imshow(correctionPhase%(2*np.pi))
     plt.show()
@@ -1379,7 +1387,7 @@ def testCorrection():
     
 if __name__ == "__main__":
     
-    # testCorrection()
+    testCorrection()
     
     # data = calcUtils.loadNpz()
     
@@ -1393,9 +1401,9 @@ if __name__ == "__main__":
 
     # server.testU0_v0()
 
-    server.CAM.set_integration_time(600e3)
-    server.CAM.nFrames = 5
-    server.calibrate_wavefront_pt3(S=240,focal_length=0.8, live_view=True,live_every=4, skip_gradient_search=False, max_iter=10)
+    server.CAM.set_integration_time(200e3)
+    server.CAM.nFrames = 1
+    server.calibrate_wavefront_pt3(S=None,focal_length=0.8, live_view=True,live_every=4, skip_gradient_search=False, max_iter=10)
     
     # plotUtils.plot_wavefront(phase)
 
