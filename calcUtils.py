@@ -1649,44 +1649,44 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     resolution = data["phase"].shape
-    S = int(np.asarray(data["S"]).item()) if "S" in data else np.gcd(resolution[0], resolution[1])
-    mosaic_mask = make_patch_mosaic_mask(data["best_alphas"], data["best_betas"], S, 8e-6, data["u0"], data["v0"], resolution=resolution)
-    gx_map, gy_map = data["gx"], data["gy"]
+    # S = int(np.asarray(data["S"]).item()) if "S" in data else np.gcd(resolution[0], resolution[1])
+    # mosaic_mask = make_patch_mosaic_mask(data["best_alphas"], data["best_betas"], S, 8e-6, data["u0"], data["v0"], resolution=resolution)
+    # gx_map, gy_map = data["gx"], data["gy"]
     
-    gx_raw = data["gradients"][...,0]
-    gy_raw = data["gradients"][...,1]
+    # gx_raw = data["gradients"][...,0]
+    # gy_raw = data["gradients"][...,1]
    
-    # phase, gx, gy = sphericalPhaseTestMap(resolution, 8e-6)
-    # phase -= phase.mean()
-    # plotUtils.plot_phase_gradient(phase, gx, gy, title="Test Input")
+    # # phase, gx, gy = sphericalPhaseTestMap(resolution, 8e-6)
+    # # phase -= phase.mean()
+    # # plotUtils.plot_phase_gradient(phase, gx, gy, title="Test Input")
     
-    # dx = 8e-6
-    # phi = poisson_reconstruct_phase(gx, gy, 8e-6)
+    # # dx = 8e-6
+    # # phi = poisson_reconstruct_phase(gx, gy, 8e-6)
     
-    # phase, gx, gy = sphericalPhaseTestMap(resolution, 8e-6, exact=False)
-    # phase -= phase.mean()
-    # plotUtils.plot_phase_gradient(phase, gx, gy, title="Test Input")
+    # # phase, gx, gy = sphericalPhaseTestMap(resolution, 8e-6, exact=False)
+    # # phase -= phase.mean()
+    # # plotUtils.plot_phase_gradient(phase, gx, gy, title="Test Input")
 
-    phi = poisson_reconstruct_phase_direct_Fourier_Integration(gx_map, gy_map, 8e-6)
-    # phi -= phi.mean()
-    plotUtils.plot_camImg(gx_raw-gx_raw.mean(), "Gradient X")
-    plotUtils.plot_camImg(gy_raw-gy_raw.mean(), "Gradient Y")
+    # phi = poisson_reconstruct_phase_direct_Fourier_Integration(gx_map, gy_map, 8e-6)
+    # # phi -= phi.mean()
+    # plotUtils.plot_camImg(gx_raw-gx_raw.mean(), "Gradient X")
+    # plotUtils.plot_camImg(gy_raw-gy_raw.mean(), "Gradient Y")
     
-    plotUtils.plot_camImg(gx_map, "Gradient X interp")
-    plotUtils.plot_camImg(gy_map, "Gradient Y interp")
+    # plotUtils.plot_camImg(gx_map, "Gradient X interp")
+    # plotUtils.plot_camImg(gy_map, "Gradient Y interp")
 
 
 
-    gx_phi, gy_phi = phaseMaskToGradients(phi, 8e-6, False)
+    # gx_phi, gy_phi = phaseMaskToGradients(phi, 8e-6, False)
     
-    errGrad = np.sqrt((gy_map-gy_phi)**2+(gx_map-gx_phi)**2)
-    plotUtils.plot_camImg(errGrad, "Error Grad")
+    # errGrad = np.sqrt((gy_map-gy_phi)**2+(gx_map-gx_phi)**2)
+    # plotUtils.plot_camImg(errGrad, "Error Grad")
     
-    # plotUtils.plot_wavefront(mosaic_mask, title= "mosaic")
-    # plotUtils.plot_wavefront(data["gx"], title = "gx")
-    # plotUtils.plot_wavefront(data["gy"], title = "gy")
-    # plotUtils.plot_wavefront(phi, title="phase")
-    plotUtils.plot_phase_gradient(phi, gx_map, gy_map, title="Recon")
+    # # plotUtils.plot_wavefront(mosaic_mask, title= "mosaic")
+    # # plotUtils.plot_wavefront(data["gx"], title = "gx")
+    # # plotUtils.plot_wavefront(data["gy"], title = "gy")
+    # # plotUtils.plot_wavefront(phi, title="phase")
+    # plotUtils.plot_phase_gradient(phi, gx_map, gy_map, title="Recon")
     #patch = make_patch_ramp(1024,1024, 64, 10,10, 0.1/10e-6,0/10e-6, 10e-6)
 
     # Beispiel: Zernike-Fit direkt aus den gemessenen Patch-Gradienten.
@@ -1697,7 +1697,8 @@ if __name__ == "__main__":
         zernike_amplitudes = data["A_patch"]
     elif "power_patch" in data:
         zernike_amplitudes = np.sqrt(np.maximum(data["power_patch"], 0))
-
+    S = data["S"]
+    print(S)
     zernike_fit = fit_zernike_from_gradients(
         data["gradients"],
         resolution=resolution,
@@ -1710,6 +1711,8 @@ if __name__ == "__main__":
         regularization=0.0,
         return_details=True,
     )
+    Q, P = data["gx"].shape
+    gx_raw, gy_raw = patch_gradients_to_maps(data["gradients"],P,Q,S)
 
     phase_zernike = zernike_fit["phase"]
     residuals_zernike = zernike_fit["residuals"]
@@ -1730,6 +1733,16 @@ if __name__ == "__main__":
     print(f"Zernike gradient residual RMS: {zernike_fit['residual_rms']:.6e} rad/m")
 
     plotUtils.plot_wavefront(phase_zernike, title="Zernike fitted phase")
+
+    plotUtils.plot_wavefront(phase_zernike%(2*np.pi), title = "phase")
+    
+    plotUtils.plot_phase_gradient(
+        phase_zernike,
+        gx_raw,
+        gy_raw,
+        title="Zernike phase with measured gradients",
+    )
+
     plotUtils.plot_phase_gradient(
         phase_zernike,
         gx_zernike,

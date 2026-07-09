@@ -4,6 +4,7 @@ import plotUtils
 import numpy as np
 import matplotlib.pyplot as plt
 import time
+from pathlib import Path
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import RectangleSelector
 from math import gcd
@@ -1259,7 +1260,137 @@ class Calibrators:
     def __init__(self): 
         pass
     
-    
+
+def save_zernike_phase_from_npz(
+    input_path=None,
+    output_phase_path="log/zernike_phase.npy",
+    output_data_path="log/zernike_fit.npz",
+    slm_pitch=(25e-6, 75e-6),
+    zernike_indices=range(2, 16),
+    aperture_mode="full_slm_diagonal",
+    amplitude_threshold=0.05,
+    regularization=0.0,
+    plot=True,
+):
+    """Load one calibration .npz file, fit Zernikes, and save the fitted phase."""
+    data = calcUtils.loadNpz(input_path)
+
+    if "gradients" not in data:
+        raise KeyError('The selected .npz file must contain data["gradients"].')
+
+    if "phase" in data:
+        resolution = data["phase"].shape
+    elif "gx" in data:
+        resolution = data["gx"].shape
+    else:
+        raise KeyError('The selected .npz file must contain data["phase"] or data["gx"].')
+
+    if "S" not in data:
+        raise KeyError('The selected .npz file must contain data["S"].')
+    S_data = np.asarray(data["S"]).squeeze()
+    if S_data.shape == ():
+        S = int(S_data.item())
+    elif S_data.size == 2:
+        S = tuple(np.ravel(S_data).astype(int))
+    else:
+        raise ValueError('data["S"] must be a scalar or contain two patch-size values.')
+
+    if "slm_pitch" in data:
+        slm_pitch = tuple(np.asarray(data["slm_pitch"], dtype=float).ravel())
+        if len(slm_pitch) == 1:
+            slm_pitch = float(slm_pitch[0])
+        elif len(slm_pitch) != 2:
+            raise ValueError('data["slm_pitch"] must contain one or two values.')
+
+    amplitudes = None
+    if "A_patch" in data:
+        amplitudes = data["A_patch"]
+    elif "power_patch" in data:
+        amplitudes = np.sqrt(np.maximum(data["power_patch"], 0))
+
+    zernike_fit = calcUtils.fit_zernike_from_gradients(
+        data["gradients"],
+        resolution=resolution,
+        patch_size=S,
+        slm_pitch=slm_pitch,
+        zernike_indices=zernike_indices,
+        amplitudes=amplitudes,
+        aperture_mode=aperture_mode,
+        amplitude_threshold=amplitude_threshold if amplitudes is not None else None,
+        regularization=regularization,
+        return_details=True,
+    )
+
+    phase_zernike = zernike_fit["phase"]
+    Path(output_phase_path).parent.mkdir(parents=True, exist_ok=True)
+    np.save(output_phase_path, phase_zernike)
+
+    if output_data_path is not None:
+        calcUtils.saveNpz(
+            {
+                "phase_zernike": phase_zernike,
+                "residuals_zernike": zernike_fit["residuals"],
+                "gx_fit_zernike": zernike_fit["gx_fit"],
+                "gy_fit_zernike": zernike_fit["gy_fit"],
+                "valid_mask_zernike": zernike_fit["valid_mask"],
+                "zernike_indices": np.asarray(zernike_fit["zernike_indices"]),
+                "zernike_coefficients": np.asarray(
+                    [zernike_fit["coefficients"][idx] for idx in zernike_fit["zernike_indices"]]
+                ),
+                "zernike_coefficients_waves": np.asarray(
+                    [zernike_fit["coefficients_waves"][idx] for idx in zernike_fit["zernike_indices"]]
+                ),
+                "residual_rms": np.asarray(zernike_fit["residual_rms"]),
+                "slm_pitch": np.asarray(zernike_fit["aperture"]["slm_pitch"]),
+                "aperture_radius": np.asarray(zernike_fit["aperture"]["radius"]),
+                "aperture_center": np.asarray(zernike_fit["aperture"]["center"]),
+            },
+            output_data_path,
+        )
+
+    print(f"Saved Zernike phase to {output_phase_path}")
+    if output_data_path is not None:
+        print(f"Saved Zernike fit data to {output_data_path}")
+    print(f"Zernike gradient residual RMS: {zernike_fit['residual_rms']:.6e} rad/m")
+    print("Zernike coefficients:")
+    for fringe_index in zernike_fit["zernike_indices"]:
+        coeff = zernike_fit["coefficients"][fringe_index]
+        coeff_waves = zernike_fit["coefficients_waves"][fringe_index]
+        print(f"  fringe {fringe_index:2d}: {coeff: .6e} rad ({coeff_waves: .6e} waves)")
+
+    if plot:
+        gx_measured_map = calcUtils.interpolate_patch_values(
+            data["gradients"][..., 0],
+            resolution[1],
+            resolution[0],
+            S,
+            kind="linear",
+        )
+        gy_measured_map = calcUtils.interpolate_patch_values(
+            data["gradients"][..., 1],
+            resolution[1],
+            resolution[0],
+            S,
+            kind="linear",
+        )
+        residual_mag = np.sqrt(
+            zernike_fit["residuals"][..., 0] ** 2
+            + zernike_fit["residuals"][..., 1] ** 2
+        )
+
+        plotUtils.plot_wavefront(phase_zernike, title="Zernike phase")
+        plotUtils.plot_phase_gradient(
+            phase_zernike,
+            gx_measured_map,
+            gy_measured_map,
+            title="Zernike phase with measured gradients",
+        )
+        plotUtils.plot_camImg(residual_mag, title="Zernike gradient residual magnitude")
+        plt.show()
+
+    return phase_zernike, zernike_fit
+
+
 def playground():  
     # wf = np.load("log/wavefrontmap.npy")
     # gx = np.load("log/gx_map.npy")
@@ -1364,29 +1495,33 @@ def playground():
 def testCorrection():
     server = Server("pt3", False, False)
 
-    correctionPhase = np.load("log/wavefrontmap_pt3.npy")
-    spie_phase = np.load("log/twoSpot_phase.npy")
+    correctionPhase = np.load("log/zernike_phase.npy")
+    normal_phase = np.load("log/5Spots_phase.npy") #*2*np.pi
+    shifted_phase = np.load("log/3x3_extrawide_shifted_phase.npy") #*2*np.pi
 
     plt.imshow(correctionPhase%(2*np.pi))
     plt.show()
 
     black, white = np.zeros(server.SLM.resolution)+1e-15, np.ones(server.SLM.resolution)
 
-    spie_corrected = (spie_phase - correctionPhase)%(np.pi * 2)
+    normal_corrected = (normal_phase + correctionPhase)%(np.pi * 2)
+    shifted_corrected = (shifted_phase + correctionPhase)%(np.pi * 2)
+   
    
     while True:
 
-        print("showing reference")
+        print("normal")
 
-        server.showHologram(spie_phase+np.pi, white, False)
+        server.showHologram(normal_corrected, white, False)
 
         input("press for next")
-        print("showing correction")
-        server.showHologram(spie_corrected, white, False)
-        input("show next")
+        # print("shifted")
+        # server.showHologram(shifted_corrected, white, False)
+        # input("show next")
     
 if __name__ == "__main__":
     
+    #save_zernike_phase_from_npz()
     testCorrection()
     
     # data = calcUtils.loadNpz()
