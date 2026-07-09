@@ -311,6 +311,376 @@ def wavefront_from_fringe(coeffs, grid_size=512):
     return W*2*np.pi
 
 
+def _normalize_resolution(resolution):
+    if len(resolution) != 2:
+        raise ValueError("resolution must be a two-value tuple (rows, cols).")
+    rows, cols = int(resolution[0]), int(resolution[1])
+    if rows <= 0 or cols <= 0:
+        raise ValueError("resolution values must be greater than 0.")
+    return rows, cols
+
+
+def _zernike_aperture_parameters(
+    resolution,
+    slm_pitch,
+    aperture_mode="full_slm_diagonal",
+    center=None,
+    radius=None,
+):
+    rows, cols = _normalize_resolution(resolution)
+    x_pitch, y_pitch = _normalize_pixel_pitch(slm_pitch, "slm_pitch")
+
+    if center is None:
+        cx = (cols - 1) / 2
+        cy = (rows - 1) / 2
+    else:
+        if len(center) != 2:
+            raise ValueError("center must be a two-value tuple (cx, cy).")
+        cx, cy = float(center[0]), float(center[1])
+
+    width = cols * x_pitch
+    height = rows * y_pitch
+
+    mode = str(aperture_mode).lower()
+    if mode in ("full_slm_diagonal", "diagonal", "full"):
+        rx = ry = np.hypot(width / 2, height / 2)
+    elif mode in ("pupil_circle", "inscribed_circle", "circle"):
+        rx = ry = min(width, height) / 2
+    elif mode in ("ellipse", "inscribed_ellipse"):
+        rx = width / 2
+        ry = height / 2
+    elif mode == "custom":
+        if radius is None:
+            raise ValueError('radius must be provided when aperture_mode="custom".')
+        if np.isscalar(radius):
+            rx = ry = float(radius)
+        else:
+            if len(radius) != 2:
+                raise ValueError("radius must be a scalar or a two-value tuple.")
+            rx, ry = float(radius[0]), float(radius[1])
+    else:
+        raise ValueError(
+            'aperture_mode must be "full_slm_diagonal", "pupil_circle", '
+            '"ellipse", or "custom".'
+        )
+
+    if rx <= 0 or ry <= 0:
+        raise ValueError("aperture radius values must be greater than 0.")
+
+    return {
+        "mode": aperture_mode,
+        "center": (cx, cy),
+        "radius": (rx, ry),
+        "slm_pitch": (x_pitch, y_pitch),
+        "physical_size": (width, height),
+    }
+
+
+def _zernike_normalized_coordinates(x, y, rx, ry):
+    u = x / rx
+    v = y / ry
+    rho = np.hypot(u, v)
+    theta = np.arctan2(v, u)
+    return u, v, rho, theta
+
+
+def _zernike_fringe_value(fringe_index, u, v):
+    rho = np.hypot(u, v)
+    theta = np.arctan2(v, u)
+    return np.asarray(ZernPol(fringe=int(fringe_index)).polynomial_value(rho, theta), dtype=float)
+
+
+def _zernike_fringe_gradient(fringe_index, u, v, rx, ry, eps=1e-5):
+    if eps <= 0:
+        raise ValueError("eps must be greater than 0.")
+
+    dZ_du = (
+        _zernike_fringe_value(fringe_index, u + eps, v)
+        - _zernike_fringe_value(fringe_index, u - eps, v)
+    ) / (2 * eps)
+    dZ_dv = (
+        _zernike_fringe_value(fringe_index, u, v + eps)
+        - _zernike_fringe_value(fringe_index, u, v - eps)
+    ) / (2 * eps)
+
+    return dZ_du / rx, dZ_dv / ry
+
+
+def _patch_center_coordinates(gradients, resolution, patch_size, slm_pitch, center):
+    gradients = np.asarray(gradients, dtype=float)
+    if gradients.ndim != 3 or gradients.shape[-1] != 2:
+        raise ValueError("gradients must have shape (N, M, 2).")
+
+    rows, cols = _normalize_resolution(resolution)
+    Sx, Sy = _normalize_patch_size(patch_size, "patch_size")
+    x_pitch, y_pitch = _normalize_pixel_pitch(slm_pitch, "slm_pitch")
+    cx, cy = center
+
+    N, M, _ = gradients.shape
+    if M * Sx > cols or N * Sy > rows:
+        raise ValueError("patch_size is too large for the gradient grid and SLM resolution.")
+
+    x_px = (np.arange(M, dtype=float) + 0.5) * Sx
+    y_px = (np.arange(N, dtype=float) + 0.5) * Sy
+    x_grid_px, y_grid_px = np.meshgrid(x_px, y_px)
+
+    x = (x_grid_px - cx) * x_pitch
+    y = (y_grid_px - cy) * y_pitch
+    return x, y
+
+
+def fit_zernike_from_gradients(
+    gradients,
+    resolution,
+    patch_size,
+    slm_pitch,
+    zernike_indices=None,
+    amplitudes=None,
+    aperture_mode="full_slm_diagonal",
+    center=None,
+    radius=None,
+    regularization=0.0,
+    remove_tip_tilt=False,
+    amplitude_threshold=None,
+    derivative_eps=1e-5,
+    output_wrapped=False,
+    outside_aperture_value=0.0,
+    return_details=False,
+):
+    """Fit Zernike modes directly to measured phase gradients.
+
+    The input gradients are expected in physical units [rad/m] on the SLM
+    plane. The Zernike basis is evaluated at the corresponding patch centers
+    after normalizing physical SLM coordinates to the selected aperture.
+
+    Parameters
+    ----------
+    gradients : ndarray (N, M, 2)
+        Patch gradients with gradients[..., 0] = dphi/dx and
+        gradients[..., 1] = dphi/dy in rad/m.
+    resolution : tuple
+        Full SLM resolution as (rows, cols).
+    patch_size : int or tuple
+        Patch size in SLM pixels. A tuple is interpreted as (Sx, Sy).
+    slm_pitch : float or tuple
+        SLM pixel pitch in meters. A tuple is interpreted as
+        (x_pitch, y_pitch).
+    zernike_indices : sequence of int, optional
+        Fringe indices passed to zernpy. Piston (fringe 1) is removed because
+        it cannot be determined from gradients. Defaults to fringe 2..15.
+    amplitudes : ndarray (N, M), optional
+        Optional patch amplitudes used as measurement weights.
+    aperture_mode : {"full_slm_diagonal", "pupil_circle", "ellipse", "custom"}
+        Coordinate normalization used for the Zernike aperture.
+    center : tuple, optional
+        Aperture center in SLM pixels as (cx, cy). Defaults to display center.
+    radius : float or tuple, optional
+        Custom aperture radius in meters for aperture_mode="custom".
+    regularization : float, optional
+        Ridge regularization strength. 0 means ordinary least squares.
+    remove_tip_tilt : bool, optional
+        If True, fringe indices 2 and 3 are removed from the fit.
+    amplitude_threshold : float, optional
+        Relative amplitude threshold in [0, 1]. Patches below this normalized
+        amplitude are excluded.
+    derivative_eps : float, optional
+        Finite-difference step in normalized Zernike coordinates.
+    output_wrapped : bool, optional
+        If True, wrap the returned phase to [0, 2*pi).
+    outside_aperture_value : float, optional
+        Value assigned to SLM pixels outside rho <= 1.
+    return_details : bool, optional
+        If True, return a diagnostics dictionary instead of the compact tuple.
+
+    Returns
+    -------
+    phase_fit : ndarray (rows, cols)
+        Fitted unwrapped phase mask in radians, or wrapped if output_wrapped is
+        True.
+    residuals : ndarray (N, M, 2)
+        Measured minus fitted gradients at the patch centers in rad/m.
+    coefficients : dict
+        Mapping {fringe_index: coefficient_in_radians}.
+    """
+    gradients = np.asarray(gradients, dtype=float)
+    if gradients.ndim != 3 or gradients.shape[-1] != 2:
+        raise ValueError("gradients must have shape (N, M, 2).")
+    if not np.any(np.isfinite(gradients)):
+        raise ValueError("gradients contain no finite values.")
+    if regularization < 0:
+        raise ValueError("regularization must not be negative.")
+
+    rows, cols = _normalize_resolution(resolution)
+    aperture = _zernike_aperture_parameters(
+        (rows, cols),
+        slm_pitch,
+        aperture_mode=aperture_mode,
+        center=center,
+        radius=radius,
+    )
+    x_pitch, y_pitch = aperture["slm_pitch"]
+    rx, ry = aperture["radius"]
+    cx, cy = aperture["center"]
+
+    if zernike_indices is None:
+        zernike_indices = list(range(2, 16))
+    zernike_indices = [int(idx) for idx in zernike_indices if int(idx) != 1]
+    if remove_tip_tilt:
+        zernike_indices = [idx for idx in zernike_indices if idx not in (2, 3)]
+    if len(zernike_indices) == 0:
+        raise ValueError("At least one non-piston Zernike index is required.")
+
+    x_patch, y_patch = _patch_center_coordinates(
+        gradients,
+        (rows, cols),
+        patch_size,
+        (x_pitch, y_pitch),
+        (cx, cy),
+    )
+    u_patch, v_patch, rho_patch, _ = _zernike_normalized_coordinates(
+        x_patch,
+        y_patch,
+        rx,
+        ry,
+    )
+
+    valid = (
+        np.isfinite(gradients[..., 0])
+        & np.isfinite(gradients[..., 1])
+        & (rho_patch <= 1.0 + 1e-12)
+    )
+
+    patch_weights = np.ones(gradients.shape[:2], dtype=float)
+    if amplitudes is not None:
+        amplitudes = np.asarray(amplitudes, dtype=float)
+        if amplitudes.shape != gradients.shape[:2]:
+            raise ValueError("amplitudes must have shape gradients.shape[:2].")
+        finite_amp = np.isfinite(amplitudes)
+        valid &= finite_amp
+        if np.any(finite_amp):
+            amp_max = np.nanmax(amplitudes[finite_amp])
+        else:
+            amp_max = 0.0
+        if amp_max > 0:
+            patch_weights = np.clip(amplitudes / amp_max, 0.0, None)
+        else:
+            patch_weights = np.zeros_like(amplitudes, dtype=float)
+        valid &= patch_weights > 0
+        if amplitude_threshold is not None:
+            if amplitude_threshold < 0:
+                raise ValueError("amplitude_threshold must not be negative.")
+            valid &= patch_weights >= amplitude_threshold
+
+    if not np.any(valid):
+        raise ValueError("No valid patches are available for the Zernike fit.")
+
+    u_valid = u_patch[valid]
+    v_valid = v_patch[valid]
+    gx_valid = gradients[..., 0][valid]
+    gy_valid = gradients[..., 1][valid]
+    weights_valid = np.sqrt(np.clip(patch_weights[valid], 0.0, None))
+
+    num_points = u_valid.size
+    num_modes = len(zernike_indices)
+    A = np.empty((2 * num_points, num_modes), dtype=float)
+    b = np.empty(2 * num_points, dtype=float)
+    b[0::2] = gx_valid
+    b[1::2] = gy_valid
+
+    for col_idx, fringe_index in enumerate(zernike_indices):
+        dz_dx, dz_dy = _zernike_fringe_gradient(
+            fringe_index,
+            u_valid,
+            v_valid,
+            rx,
+            ry,
+            eps=derivative_eps,
+        )
+        A[0::2, col_idx] = dz_dx
+        A[1::2, col_idx] = dz_dy
+
+    row_weights = np.empty(2 * num_points, dtype=float)
+    row_weights[0::2] = weights_valid
+    row_weights[1::2] = weights_valid
+    A_weighted = A * row_weights[:, None]
+    b_weighted = b * row_weights
+
+    finite_rows = np.all(np.isfinite(A_weighted), axis=1) & np.isfinite(b_weighted)
+    if not np.any(finite_rows):
+        raise ValueError("Zernike design matrix contains no finite rows.")
+
+    A_solve = A_weighted[finite_rows]
+    b_solve = b_weighted[finite_rows]
+    if regularization > 0:
+        normal = A_solve.T @ A_solve
+        rhs = A_solve.T @ b_solve
+        coeff_array = np.linalg.solve(
+            normal + regularization * np.eye(num_modes),
+            rhs,
+        )
+    else:
+        coeff_array, *_ = np.linalg.lstsq(A_solve, b_solve, rcond=None)
+
+    coefficients = {
+        int(fringe_index): float(coeff)
+        for fringe_index, coeff in zip(zernike_indices, coeff_array)
+    }
+
+    fit_flat = A @ coeff_array
+    gx_fit_valid = fit_flat[0::2]
+    gy_fit_valid = fit_flat[1::2]
+
+    gx_fit = np.full(gradients.shape[:2], np.nan, dtype=float)
+    gy_fit = np.full(gradients.shape[:2], np.nan, dtype=float)
+    gx_fit[valid] = gx_fit_valid
+    gy_fit[valid] = gy_fit_valid
+
+    residuals = np.full_like(gradients, np.nan, dtype=float)
+    residuals[..., 0][valid] = gradients[..., 0][valid] - gx_fit_valid
+    residuals[..., 1][valid] = gradients[..., 1][valid] - gy_fit_valid
+
+    x_px = np.arange(cols, dtype=float)
+    y_px = np.arange(rows, dtype=float)
+    x = (x_px - cx) * x_pitch
+    y = (y_px - cy) * y_pitch
+    X, Y = np.meshgrid(x, y)
+    u_full, v_full, rho_full, _ = _zernike_normalized_coordinates(X, Y, rx, ry)
+
+    phase_fit = np.zeros((rows, cols), dtype=float)
+    for fringe_index, coeff in coefficients.items():
+        phase_fit += coeff * _zernike_fringe_value(fringe_index, u_full, v_full)
+
+    inside = rho_full <= 1.0 + 1e-12
+    if outside_aperture_value is not None:
+        phase_fit[~inside] = outside_aperture_value
+
+    if np.any(inside):
+        phase_fit[inside] -= np.nanmean(phase_fit[inside])
+    if output_wrapped:
+        phase_fit = wrap_phase(phase_fit)
+
+    residual_rms = np.sqrt(np.nanmean(residuals[..., 0] ** 2 + residuals[..., 1] ** 2))
+
+    if return_details:
+        return {
+            "phase": phase_fit,
+            "residuals": residuals,
+            "coefficients": coefficients,
+            "coefficients_waves": {
+                int(idx): float(coeff / (2 * np.pi))
+                for idx, coeff in coefficients.items()
+            },
+            "zernike_indices": list(zernike_indices),
+            "gx_fit": gx_fit,
+            "gy_fit": gy_fit,
+            "valid_mask": valid,
+            "residual_rms": float(residual_rms),
+            "aperture": aperture,
+        }
+
+    return phase_fit, residuals, coefficients
+
+
 
 
 def wrap_phase(phi):
@@ -1279,7 +1649,7 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     resolution = data["phase"].shape
-    S = np.gcd(resolution[0], resolution[1])
+    S = int(np.asarray(data["S"]).item()) if "S" in data else np.gcd(resolution[0], resolution[1])
     mosaic_mask = make_patch_mosaic_mask(data["best_alphas"], data["best_betas"], S, 8e-6, data["u0"], data["v0"], resolution=resolution)
     gx_map, gy_map = data["gx"], data["gy"]
     
@@ -1318,6 +1688,66 @@ if __name__ == "__main__":
     # plotUtils.plot_wavefront(phi, title="phase")
     plotUtils.plot_phase_gradient(phi, gx_map, gy_map, title="Recon")
     #patch = make_patch_ramp(1024,1024, 64, 10,10, 0.1/10e-6,0/10e-6, 10e-6)
+
+    # Beispiel: Zernike-Fit direkt aus den gemessenen Patch-Gradienten.
+    # Fuer pt3 sind die Pixel asymmetrisch; ggf. hier die kalibrierten Werte einsetzen.
+    slm_pitch_zernike = (25e-6, 75e-6)
+    zernike_amplitudes = None
+    if "A_patch" in data:
+        zernike_amplitudes = data["A_patch"]
+    elif "power_patch" in data:
+        zernike_amplitudes = np.sqrt(np.maximum(data["power_patch"], 0))
+
+    zernike_fit = fit_zernike_from_gradients(
+        data["gradients"],
+        resolution=resolution,
+        patch_size=S,
+        slm_pitch=slm_pitch_zernike,
+        zernike_indices=range(2, 16),
+        amplitudes=zernike_amplitudes,
+        aperture_mode="full_slm_diagonal",
+        amplitude_threshold=0.05 if zernike_amplitudes is not None else None,
+        regularization=0.0,
+        return_details=True,
+    )
+
+    phase_zernike = zernike_fit["phase"]
+    residuals_zernike = zernike_fit["residuals"]
+    gx_zernike, gy_zernike = phaseMaskToGradients(
+        phase_zernike,
+        slm_pitch_zernike,
+        unwrap=False,
+    )
+    residual_mag = np.sqrt(
+        residuals_zernike[..., 0] ** 2
+        + residuals_zernike[..., 1] ** 2
+    )
+
+    print("Zernike coefficients [rad]:")
+    for fringe_index, coefficient in zernike_fit["coefficients"].items():
+        coefficient_waves = zernike_fit["coefficients_waves"][fringe_index]
+        print(f"  fringe {fringe_index:2d}: {coefficient: .6e} rad ({coefficient_waves: .6e} waves)")
+    print(f"Zernike gradient residual RMS: {zernike_fit['residual_rms']:.6e} rad/m")
+
+    plotUtils.plot_wavefront(phase_zernike, title="Zernike fitted phase")
+    plotUtils.plot_phase_gradient(
+        phase_zernike,
+        gx_zernike,
+        gy_zernike,
+        title="Zernike fitted phase gradient",
+    )
+    plotUtils.plot_camImg(
+        residuals_zernike[..., 0],
+        title="Zernike residual gx on patches",
+    )
+    plotUtils.plot_camImg(
+        residuals_zernike[..., 1],
+        title="Zernike residual gy on patches",
+    )
+    plotUtils.plot_camImg(
+        residual_mag,
+        title="Zernike residual magnitude on patches",
+    )
     
     
     plt.show()
