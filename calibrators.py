@@ -1264,6 +1264,7 @@ class Server:
 
             if u0 is None:
                 u0 = 0.1 / x_pitch
+                u0 *= 1.5
             if v0 is None:
                 v0 = -0.1 / y_pitch
 
@@ -2395,7 +2396,7 @@ def testCorrection():
 if __name__ == "__main__":
     
     #save_zernike_phase_from_npz()
-    testCorrection()
+    # testCorrection()
     
     # data = calcUtils.loadNpz()
     
@@ -2405,12 +2406,12 @@ if __name__ == "__main__":
     #                                                  data["S"], server.SLM.pitch, data["u0"], data["v0"], server.SLM.resolution)
 
     # save_zernike_phase_from_npz(output_phase_path="log/zernike_phase.npy")
-    playground()
+    # playground()
     # plt.show()
 
     # server.testU0_v0()
 
-    server.CAM.set_integration_time(200e3)
+    server.CAM.set_integration_time(160e3)
     server.CAM.nFrames = 1
     server.calibrate_wavefront_pt3(S=None,focal_length=0.8, live_view=True,live_every=4, skip_gradient_search=False, max_iter=10)
     
