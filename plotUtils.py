@@ -574,4 +574,44 @@ def save_calibration_plots(data, log_directory, dpi=250):
     _save_calibration_figure(fig, output_path, dpi)
     saved_paths.append(output_path)
 
+    # 09: Dedicated patch-amplitude diagnostics
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    _plot_calibration_image(
+        axes[0],
+        amplitude,
+        "Patch amplitude map",
+        "Normalized amplitude",
+    )
+    axes[0].set_xlabel("Patch x index")
+    axes[0].set_ylabel("Patch y index")
+
+    valid_amplitudes = amplitude[valid_spots & np.isfinite(amplitude)]
+    if valid_amplitudes.size:
+        bins = min(30, max(5, int(np.sqrt(valid_amplitudes.size))))
+        axes[1].hist(valid_amplitudes, bins=bins, color="tab:blue", alpha=0.85)
+        axes[1].axvline(
+            np.mean(valid_amplitudes),
+            color="tab:red",
+            linestyle="--",
+            label=f"Mean = {np.mean(valid_amplitudes):.3f}",
+        )
+        axes[1].legend()
+    else:
+        axes[1].text(
+            0.5,
+            0.5,
+            "No valid patch amplitudes available",
+            ha="center",
+            va="center",
+            transform=axes[1].transAxes,
+        )
+    axes[1].set_title("Patch amplitude distribution")
+    axes[1].set_xlabel("Normalized amplitude")
+    axes[1].set_ylabel("Patch count")
+    axes[1].grid(alpha=0.25)
+    fig.suptitle("Patch amplitudes", fontsize=16)
+    output_path = plots_directory / "09_patch_amplitude.png"
+    _save_calibration_figure(fig, output_path, dpi)
+    saved_paths.append(output_path)
+
     return saved_paths

@@ -297,6 +297,10 @@ def _save_calibration_outputs(data, log_directory):
     np.save(log_directory / "phase.npy", data["phase"])
     np.save(log_directory / "background.npy", data["background_image"])
     np.save(log_directory / "reference.npy", data["reference_image"])
+    calcUtils.saveNpz(
+        {"A_patch": np.asarray(data["A_patch"], dtype=float)},
+        log_directory / "A_patch.npz",
+    )
     if zernike_fit is not None:
         np.save(log_directory / "zernike_phase.npy", data["zernike_phase"])
         calcUtils.saveNpz(
