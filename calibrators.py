@@ -50,6 +50,20 @@ class _TeeStream:
         for stream in self.streams:
             stream.flush()
 
+    def fileno(self):
+        return self.streams[0].fileno()
+
+    def isatty(self):
+        return self.streams[0].isatty()
+
+    @property
+    def encoding(self):
+        return self.streams[0].encoding
+
+    @property
+    def errors(self):
+        return self.streams[0].errors
+
 
 def _iso_timestamp():
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -384,9 +398,14 @@ class LiveCalibrationView:
 
     def select_roi(self, image_shape=None, initial_roi=None):
         selected_roi = {"value": None}
+        selection_state = {"finished": False, "closed": False}
 
         if initial_roi is not None:
             self.set_roi(initial_roi)
+
+        def finish_selection():
+            selection_state["finished"] = True
+            self.fig.canvas.stop_event_loop()
 
         def onselect(eclick, erelease):
             if eclick.xdata is None or eclick.ydata is None:
@@ -400,6 +419,17 @@ class LiveCalibrationView:
             )
             selected_roi["value"] = roi
             self.set_roi(roi)
+
+        def on_key_press(event):
+            if event.key in ("enter", "return"):
+                finish_selection()
+            elif event.key == "escape":
+                selected_roi["value"] = None
+                finish_selection()
+
+        def on_close(_event):
+            selection_state["closed"] = True
+            finish_selection()
 
         selector_kwargs = dict(
             useblit=True,
@@ -428,22 +458,39 @@ class LiveCalibrationView:
             )
 
         previous_title = self.fig._suptitle.get_text() if self.fig._suptitle else ""
-        self.fig.suptitle("Wavefront calibration - draw ROI on reference spot, then press Enter")
+        self.fig.suptitle(
+            "Wavefront calibration - draw ROI, then press Enter in this window"
+        )
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
 
-        input("Draw ROI in the live view, then press Enter to continue.")
+        key_connection = self.fig.canvas.mpl_connect("key_press_event", on_key_press)
+        close_connection = self.fig.canvas.mpl_connect("close_event", on_close)
+        print("Draw the ROI in the live view and press Enter in the plot window.")
 
-        selector.set_active(False)
-        selector.disconnect_events()
-        self.fig.suptitle(previous_title)
+        try:
+            while (
+                not selection_state["finished"]
+                and plt.fignum_exists(self.fig.number)
+            ):
+                self.fig.canvas.start_event_loop(0.1)
+        finally:
+            selector.set_active(False)
+            selector.disconnect_events()
+            self.fig.canvas.mpl_disconnect(key_connection)
+            self.fig.canvas.mpl_disconnect(close_connection)
+            if plt.fignum_exists(self.fig.number):
+                self.fig.suptitle(previous_title)
 
         if selected_roi["value"] is None:
             if initial_roi is None:
+                if selection_state["closed"]:
+                    raise RuntimeError("The live view was closed before an ROI was selected.")
                 raise RuntimeError("No ROI was selected.")
             selected_roi["value"] = initial_roi
 
-        self.set_roi(selected_roi["value"])
+        if plt.fignum_exists(self.fig.number):
+            self.set_roi(selected_roi["value"])
         return selected_roi["value"]
 
     def update(self, holo=None, cam_img=None, title=None, cam_com=None, patch_center=None, cam_ref_com=None, roi = None):
