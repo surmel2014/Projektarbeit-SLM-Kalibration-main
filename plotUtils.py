@@ -306,11 +306,21 @@ def save_calibration_plots(data, log_directory, dpi=250):
     )
     if amplitude_valid.shape != amplitude.shape:
         amplitude_valid = valid_spots.copy()
+    gradient_exposure_valid = np.asarray(
+        data.get("gradient_exposure_valid", valid_spots),
+        dtype=bool,
+    )
+    if gradient_exposure_valid.shape != amplitude.shape:
+        gradient_exposure_valid = valid_spots.copy()
     invalid_patches = (
         ~valid_spots
         | (
             bool(data.get("separate_amplitude_measurement", False))
             & ~amplitude_valid
+        )
+        | (
+            bool(data.get("adaptive_gradient_exposure", False))
+            & ~gradient_exposure_valid
         )
     ).astype(float)
     saved_paths = []
@@ -323,7 +333,10 @@ def save_calibration_plots(data, log_directory, dpi=250):
     _plot_calibration_image(axes[1, 0], amplitude, "Normalized patch amplitude", "Relative amplitude")
     power_label = (
         "Power rate [a.u./us]"
-        if data.get("separate_amplitude_measurement", False)
+        if (
+            data.get("separate_amplitude_measurement", False)
+            or data.get("adaptive_gradient_exposure", False)
+        )
         else "Power [a.u.]"
     )
     _plot_calibration_image(axes[1, 1], power, "Patch power", power_label)
@@ -697,6 +710,75 @@ def save_calibration_plots(data, log_directory, dpi=250):
             )
             fig.suptitle("Adaptive amplitude measurement", fontsize=16)
             output_path = plots_directory / "10_amplitude_exposure.png"
+            _save_calibration_figure(fig, output_path, dpi)
+            saved_paths.append(output_path)
+
+    # 11: Adaptive exposure diagnostics for reference and gradient scanning
+    if data.get("adaptive_gradient_exposure", False):
+        exposure = np.asarray(data.get("gradient_exposure_us", []), dtype=float)
+        peak_fraction = np.asarray(
+            data.get("gradient_peak_fraction", []),
+            dtype=float,
+        )
+        saturation_fraction = np.asarray(
+            data.get("gradient_saturation_fraction", []),
+            dtype=float,
+        )
+        if (
+            exposure.shape == amplitude.shape
+            and peak_fraction.shape == amplitude.shape
+            and saturation_fraction.shape == amplitude.shape
+        ):
+            fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+            _plot_calibration_image(
+                axes[0, 0],
+                exposure,
+                "Gradient-scan exposure time",
+                "Exposure [us]",
+            )
+            _plot_calibration_image(
+                axes[0, 1],
+                100 * peak_fraction,
+                "Gradient-scan raw peak level",
+                "Full scale [%]",
+                "magma",
+            )
+            _plot_calibration_image(
+                axes[1, 0],
+                100 * saturation_fraction,
+                "Gradient-scan saturated pixel fraction",
+                "ROI pixels [%]",
+                "magma",
+            )
+            validity_image = gradient_exposure_valid.astype(float)
+            im = axes[1, 1].imshow(
+                validity_image,
+                cmap="RdYlGn",
+                origin="lower",
+                vmin=0,
+                vmax=1,
+                aspect="auto",
+            )
+            axes[1, 1].set_title("Gradient exposure validity")
+            axes[1, 1].set_xlabel("Patch x index")
+            axes[1, 1].set_ylabel("Patch y index")
+            fig.colorbar(
+                im,
+                ax=axes[1, 1],
+                ticks=[0, 1],
+                label="0 = outside target, 1 = valid",
+            )
+            reference_exposure = data.get("reference_exposure_us")
+            reference_note = (
+                ""
+                if reference_exposure is None
+                else f"; reference exposure = {float(reference_exposure):.1f} us"
+            )
+            fig.suptitle(
+                f"Adaptive gradient exposure{reference_note}",
+                fontsize=16,
+            )
+            output_path = plots_directory / "11_gradient_exposure.png"
             _save_calibration_figure(fig, output_path, dpi)
             saved_paths.append(output_path)
 

@@ -257,6 +257,7 @@ def _build_calibration_metadata(data, log_directory):
         "max_step_px",
         "damping",
         "useCorrection",
+        "adaptive_gradient_exposure",
         "separate_amplitude_measurement",
         "amplitude_exposure_min_us",
         "amplitude_exposure_max_us",
@@ -303,7 +304,25 @@ def _build_calibration_metadata(data, log_directory):
         )
         metadata["results"]["patch_power_unit"] = "a.u./us"
     else:
-        metadata["results"]["patch_power_unit"] = "a.u."
+        metadata["results"]["patch_power_unit"] = (
+            "a.u./us"
+            if data.get("adaptive_gradient_exposure", False)
+            else "a.u."
+        )
+    if data.get("adaptive_gradient_exposure", False):
+        gradient_exposure_valid = np.asarray(
+            data.get("gradient_exposure_valid", []),
+            dtype=bool,
+        )
+        metadata["results"]["valid_gradient_exposure_count"] = int(
+            np.count_nonzero(gradient_exposure_valid)
+        )
+        metadata["results"]["reference_exposure_us"] = _json_compatible(
+            data.get("reference_exposure_us")
+        )
+        metadata["results"]["reference_exposure_valid"] = bool(
+            data.get("reference_exposure_valid", False)
+        )
     if "zernike_indices" in data:
         metadata["zernike_fit"] = {
             "index_convention": "Fringe",
@@ -341,6 +360,10 @@ def _save_calibration_outputs(data, log_directory):
                 "amplitude_peak_fraction",
                 "amplitude_saturation_fraction",
                 "amplitude_measurement_valid",
+                "gradient_exposure_us",
+                "gradient_peak_fraction",
+                "gradient_saturation_fraction",
+                "gradient_exposure_valid",
             )
             if key in data
         },
@@ -1124,6 +1147,7 @@ class Server:
         max_step_px=300.0,
         damping=1,
         useCorrection=False,
+        adaptive_gradient_exposure=True,
         separate_amplitude_measurement=True,
         amplitude_exposure_min_us=50.0,
         amplitude_exposure_max_us=1_000_000.0,
@@ -1152,6 +1176,11 @@ class Server:
             finalen Patch-Gradienten eine adaptive, hintergrundkorrigierte und
             auf die Belichtungszeit normierte Amplitudenmessung ausgeführt.
               False verwendet wie bisher die Leistung aus der Positionssuche.
+            - Mit adaptive_gradient_exposure=True wird die Belichtungszeit für
+              den Referenzspot und einmal zu Beginn jedes neuen Patches adaptiv
+              bestimmt. Probes und Newton-Iterationen verwenden danach dieselbe
+              Patch-Belichtungszeit. Die Grenzwerte werden mit den
+              amplitude_*-Parametern konfiguriert.
         """
 
         import time
@@ -1226,6 +1255,13 @@ class Server:
             self.CAM.nFrames = camera_frames
             if hasattr(self.CAM, "get_integration_time"):
                 old_integration_time = self.CAM.get_integration_time()
+        if (
+            adaptive_gradient_exposure or separate_amplitude_measurement
+        ) and old_integration_time is None:
+            raise RuntimeError(
+                "Adaptive exposure requires a camera with "
+                "get_integration_time()."
+            )
 
         try:
             roi = _normalize_roi(roi)
@@ -1299,6 +1335,117 @@ class Server:
             # separately measured amplitudes below use an exposure-specific
             # background image instead.
             thresh_zerothorder = 0
+
+            def _set_camera_exposure(exposure_us):
+                if not hasattr(self.CAM, "set_integration_time"):
+                    raise RuntimeError(
+                        "Adaptive exposure requires a camera with "
+                        "set_integration_time()."
+                    )
+                self.CAM.set_integration_time(float(exposure_us))
+                if hasattr(self.CAM, "get_integration_time"):
+                    return float(self.CAM.get_integration_time())
+                return float(exposure_us)
+
+            def _camera_saturation_value():
+                saturation_value = amplitude_saturation_value
+                if saturation_value is None and hasattr(
+                    self.CAM,
+                    "get_saturation_value",
+                ):
+                    saturation_value = self.CAM.get_saturation_value()
+                return 255.0 if saturation_value is None else float(saturation_value)
+
+            def _capture_gradient_image(label, initial_exposure_us):
+                """Capture a spot image with ROI-controlled adaptive exposure."""
+                exposure_us = float(
+                    np.clip(
+                        initial_exposure_us,
+                        amplitude_exposure_min_us,
+                        amplitude_exposure_max_us,
+                    )
+                )
+                best_unsaturated = None
+                last_candidate = None
+
+                for attempt in range(amplitude_max_attempts):
+                    actual_exposure = _set_camera_exposure(exposure_us)
+                    image = np.asarray(
+                        self.getSettledCamImg(settle_s, discard_frames),
+                        dtype=float,
+                    )
+                    if image.ndim != 2:
+                        raise ValueError(
+                            "Expected a 2D gradient image, got "
+                            f"shape {image.shape}."
+                        )
+
+                    y0, y1, x0, x1 = roi
+                    crop = image[y0:y1, x0:x1]
+                    saturation_value = _camera_saturation_value()
+                    raw_peak_fraction = float(np.max(crop) / saturation_value)
+                    local_background = float(np.percentile(crop, 10))
+                    signal_peak_fraction = float(
+                        max(np.max(crop) - local_background, 0.0)
+                        / saturation_value
+                    )
+                    saturation_fraction = float(
+                        np.mean(crop >= 0.98 * saturation_value)
+                    )
+                    candidate = {
+                        "image": image,
+                        "exposure_us": actual_exposure,
+                        "raw_peak_fraction": raw_peak_fraction,
+                        "signal_peak_fraction": signal_peak_fraction,
+                        "saturation_fraction": saturation_fraction,
+                    }
+                    last_candidate = candidate
+                    is_unsaturated = saturation_fraction == 0.0
+                    if is_unsaturated and (
+                        best_unsaturated is None
+                        or signal_peak_fraction
+                        > best_unsaturated["signal_peak_fraction"]
+                    ):
+                        best_unsaturated = candidate
+
+                    print(
+                        f"Gradient {label} exposure attempt {attempt + 1}: "
+                        f"exposure={actual_exposure:.1f} us, "
+                        f"signal peak={100 * signal_peak_fraction:.1f}%, "
+                        f"saturated pixels={100 * saturation_fraction:.4f}%"
+                    )
+
+                    if (
+                        is_unsaturated
+                        and amplitude_target_low <= signal_peak_fraction
+                        <= amplitude_target_high
+                    ):
+                        candidate["valid"] = True
+                        return candidate
+
+                    if (
+                        not is_unsaturated
+                        or raw_peak_fraction > amplitude_target_high
+                    ):
+                        next_exposure = max(
+                            amplitude_exposure_min_us,
+                            actual_exposure / amplitude_exposure_factor,
+                        )
+                    else:
+                        next_exposure = min(
+                            amplitude_exposure_max_us,
+                            actual_exposure * amplitude_exposure_factor,
+                        )
+
+                    if np.isclose(next_exposure, actual_exposure):
+                        break
+                    exposure_us = next_exposure
+
+                selected = best_unsaturated or last_candidate
+                if selected is not None:
+                    selected["valid"] = False
+                return selected
+
             # ------------------------------------------------------------
             # 1. Referenzpatch
             # ------------------------------------------------------------
@@ -1314,8 +1461,27 @@ class Server:
 
             self.showHologram(phase_ref, amp_ref)
 
+            reference_exposure_us = old_integration_time
+            reference_exposure_valid = not adaptive_gradient_exposure
+            reference_peak_fraction = np.nan
+            reference_saturation_fraction = np.nan
             while True:
-                img_ref = self.getSettledCamImg(settle_s, discard_frames) - thresh_zerothorder
+                if adaptive_gradient_exposure:
+                    reference_measurement = _capture_gradient_image(
+                        "reference",
+                        reference_exposure_us,
+                    )
+                    img_ref = reference_measurement["image"]
+                    reference_exposure_us = reference_measurement["exposure_us"]
+                    reference_exposure_valid = reference_measurement["valid"]
+                    reference_peak_fraction = reference_measurement[
+                        "raw_peak_fraction"
+                    ]
+                    reference_saturation_fraction = reference_measurement[
+                        "saturation_fraction"
+                    ]
+                else:
+                    img_ref = self.getSettledCamImg(settle_s, discard_frames)
                 img_ref = np.clip(img_ref, 0, None)
                 
                 if live is not None:
@@ -1337,8 +1503,20 @@ class Server:
                         img_ref.shape,
                     )
 
-                com_ref, power_ref = calcUtils.spot_com_and_power(img_ref, roi)
-                print(f"ref power: {power_ref}")
+                com_ref, power_ref_raw = calcUtils.spot_com_and_power(img_ref, roi)
+                power_ref = (
+                    power_ref_raw / reference_exposure_us
+                    if adaptive_gradient_exposure
+                    else power_ref_raw
+                )
+                print(
+                    f"ref power: {power_ref}"
+                    + (
+                        f" a.u./us at {reference_exposure_us:.1f} us"
+                        if adaptive_gradient_exposure
+                        else ""
+                    )
+                )
 
                 if com_ref is not None:
                     if live is not None:
@@ -1370,6 +1548,10 @@ class Server:
             amplitude_peak_fraction = np.full((N, M), np.nan, dtype=float)
             amplitude_saturation_fraction = np.full((N, M), np.nan, dtype=float)
             amplitude_measurement_valid = np.zeros((N, M), dtype=bool)
+            gradient_exposure_us = np.full((N, M), np.nan, dtype=float)
+            gradient_peak_fraction = np.full((N, M), np.nan, dtype=float)
+            gradient_saturation_fraction = np.full((N, M), np.nan, dtype=float)
+            gradient_exposure_valid = np.zeros((N, M), dtype=bool)
 
             px_to_freq = self.CAM.pitch / (focal_length * self.waveLength)
 
@@ -1386,12 +1568,17 @@ class Server:
                 "roi": np.asarray(roi),
                 "com_ref": com_ref,
                 "power_ref": power_ref,
+                "reference_exposure_us": reference_exposure_us,
+                "reference_exposure_valid": reference_exposure_valid,
+                "reference_peak_fraction": reference_peak_fraction,
+                "reference_saturation_fraction": reference_saturation_fraction,
                 "skip_gradient_search": skip_gradient_search,
                 "probe_px": probe_px,
                 "probe_freq": probe_freq,
                 "max_step_px": max_step_px,
                 "damping": damping,
                 "useCorrection": useCorrection,
+                "adaptive_gradient_exposure": adaptive_gradient_exposure,
                 "separate_amplitude_measurement": separate_amplitude_measurement,
                 "amplitude_exposure_min_us": amplitude_exposure_min_us,
                 "amplitude_exposure_max_us": amplitude_exposure_max_us,
@@ -1426,6 +1613,10 @@ class Server:
                 "amplitude_peak_fraction": amplitude_peak_fraction,
                 "amplitude_saturation_fraction": amplitude_saturation_fraction,
                 "amplitude_measurement_valid": amplitude_measurement_valid,
+                "gradient_exposure_us": gradient_exposure_us,
+                "gradient_peak_fraction": gradient_peak_fraction,
+                "gradient_saturation_fraction": gradient_saturation_fraction,
+                "gradient_exposure_valid": gradient_exposure_valid,
             }
 
             # ------------------------------------------------------------
@@ -1444,11 +1635,47 @@ class Server:
                     phase = (phase +correctionPhase)%(2*np.pi)
                 # phase = server.mosaic * amp
                 self.showHologram(phase, amp)
-                
-                img = self.getSettledCamImg(settle_s, discard_frames) 
+
+                if adaptive_gradient_exposure:
+                    patch_exposure = gradient_exposure_us[n, m]
+                    if not np.isfinite(patch_exposure):
+                        gradient_measurement = _capture_gradient_image(
+                            f"patch ({m},{n}) initial",
+                            reference_exposure_us,
+                        )
+                        img = gradient_measurement["image"]
+                        measurement_exposure_us = gradient_measurement[
+                            "exposure_us"
+                        ]
+                        gradient_exposure_us[n, m] = measurement_exposure_us
+                        gradient_peak_fraction[n, m] = gradient_measurement[
+                            "raw_peak_fraction"
+                        ]
+                        gradient_saturation_fraction[n, m] = gradient_measurement[
+                            "saturation_fraction"
+                        ]
+                        gradient_exposure_valid[n, m] = gradient_measurement[
+                            "valid"
+                        ]
+                    else:
+                        measurement_exposure_us = _set_camera_exposure(
+                            patch_exposure
+                        )
+                        img = np.asarray(
+                            self.getSettledCamImg(settle_s, discard_frames),
+                            dtype=float,
+                        )
+                else:
+                    img = self.getSettledCamImg(settle_s, discard_frames)
+                    measurement_exposure_us = old_integration_time
                 img -= thresh_zerothorder
                 img = np.clip(img, 0, None)
-                com, power = calcUtils.spot_com_and_power(img, roi)
+                com, power_raw = calcUtils.spot_com_and_power(img, roi)
+                power = (
+                    power_raw / measurement_exposure_us
+                    if adaptive_gradient_exposure
+                    else power_raw
+                )
 
                 if live is not None:
                     do_update = True
@@ -1469,15 +1696,7 @@ class Server:
             amplitude_background_cache = {}
 
             def _set_amplitude_exposure(exposure_us):
-                if not hasattr(self.CAM, "set_integration_time"):
-                    raise RuntimeError(
-                        "Separate amplitude measurement requires a camera with "
-                        "set_integration_time()."
-                    )
-                self.CAM.set_integration_time(float(exposure_us))
-                if hasattr(self.CAM, "get_integration_time"):
-                    return float(self.CAM.get_integration_time())
-                return float(exposure_us)
+                return _set_camera_exposure(exposure_us)
 
             def _get_amplitude_background(exposure_us):
                 actual_exposure = _set_amplitude_exposure(exposure_us)
@@ -1556,14 +1775,7 @@ class Server:
                         raw_crop = raw_image[y0:y1, x0:x1]
                         corrected_crop = corrected_image[y0:y1, x0:x1]
 
-                        saturation_value = amplitude_saturation_value
-                        if saturation_value is None and hasattr(
-                            self.CAM, "get_saturation_value"
-                        ):
-                            saturation_value = self.CAM.get_saturation_value()
-                        if saturation_value is None:
-                            saturation_value = 255.0
-                        saturation_value = float(saturation_value)
+                        saturation_value = _camera_saturation_value()
 
                         raw_peak_fraction = float(
                             np.max(raw_crop) / saturation_value
