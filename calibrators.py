@@ -1,9 +1,16 @@
 import hardware
 import calcUtils
 import plotUtils
+import contextlib
+import functools
+import inspect
 import numpy as np
 import matplotlib.pyplot as plt
+import shutil
+import sys
 import time
+import traceback
+from datetime import datetime
 from pathlib import Path
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import RectangleSelector
@@ -26,6 +33,295 @@ def _normalize_roi(roi, image_shape=None):
         raise ValueError("ROI must have a positive width and height.")
 
     return (y0, y1, x0, x1)
+
+
+class _TeeStream:
+    """Write console output to the terminal and a calibration log file."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def _iso_timestamp():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _json_compatible(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, range):
+        return list(value)
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    return value
+
+
+def _write_calibration_status(
+    log_directory,
+    status,
+    started_at,
+    finished_at=None,
+    duration_seconds=None,
+    error=None,
+):
+    status_data = {
+        "status": status,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": duration_seconds,
+    }
+    if error is not None:
+        status_data["error_type"] = type(error).__name__
+        status_data["error_message"] = str(error)
+    if status == "completed":
+        status_data["artifacts"] = sorted(
+            str(path.relative_to(log_directory))
+            for path in log_directory.rglob("*")
+            if path.is_file() and path.name != "status.json"
+        )
+    calcUtils.saveJson(status_data, log_directory / "status.json")
+
+
+def _calibration_run(method):
+    """Create a run directory and maintain status/console logs around a calibration."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        log_directory = calcUtils.createCalibrationLogDir()
+        started_at = _iso_timestamp()
+        start_time = time.perf_counter()
+
+        bound = inspect.signature(method).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        call_parameters = {
+            key: _json_compatible(value)
+            for key, value in bound.arguments.items()
+            if key != "self"
+        }
+        initial_metadata = {
+            "schema_version": 1,
+            "calibration_method": method.__name__,
+            "started_at": started_at,
+            "parameters": call_parameters,
+        }
+        calcUtils.saveJson(initial_metadata, log_directory / "metadata.json")
+        _write_calibration_status(log_directory, "running", started_at)
+
+        self._active_calibration_log_directory = log_directory
+        self._active_calibration_metadata = initial_metadata
+
+        with (log_directory / "run.log").open("a", encoding="utf-8", buffering=1) as log_file:
+            stdout_tee = _TeeStream(sys.stdout, log_file)
+            stderr_tee = _TeeStream(sys.stderr, log_file)
+            with contextlib.redirect_stdout(stdout_tee), contextlib.redirect_stderr(stderr_tee):
+                print(f"Calibration log directory: {log_directory}")
+                try:
+                    result = method(self, *args, **kwargs)
+                except BaseException as exc:
+                    finished_at = _iso_timestamp()
+                    duration = time.perf_counter() - start_time
+                    print(f"Calibration failed after {duration:.3f} s: {exc}")
+                    traceback.print_exc()
+                    _write_calibration_status(
+                        log_directory,
+                        "failed",
+                        started_at,
+                        finished_at=finished_at,
+                        duration_seconds=duration,
+                        error=exc,
+                    )
+                    raise
+                else:
+                    finished_at = _iso_timestamp()
+                    duration = time.perf_counter() - start_time
+                    _write_calibration_status(
+                        log_directory,
+                        "completed",
+                        started_at,
+                        finished_at=finished_at,
+                        duration_seconds=duration,
+                    )
+                    print(f"Calibration completed in {duration:.3f} s")
+                    return result
+                finally:
+                    self._active_calibration_log_directory = None
+                    self._active_calibration_metadata = None
+
+    return wrapper
+
+
+def _add_zernike_fit(data):
+    """Fit Zernike modes 2..15 and attach coefficients and diagnostics."""
+    try:
+        zernike_fit = calcUtils.fit_zernike_from_gradients(
+            data["gradients"],
+            resolution=np.asarray(data["phase"]).shape,
+            patch_size=data["S"],
+            slm_pitch=data["slm_pitch"],
+            zernike_indices=range(2, 16),
+            amplitudes=data.get("A_patch"),
+            aperture_mode="full_slm_diagonal",
+            amplitude_threshold=0.05,
+            return_details=True,
+        )
+    except Exception as exc:
+        data["zernike_fit_error"] = str(exc)
+        print(f"Zernike fit skipped: {exc}")
+        return None
+
+    indices = np.asarray(zernike_fit["zernike_indices"], dtype=int)
+    coefficients = np.asarray(
+        [zernike_fit["coefficients"][int(index)] for index in indices],
+        dtype=float,
+    )
+    coefficients_waves = np.asarray(
+        [zernike_fit["coefficients_waves"][int(index)] for index in indices],
+        dtype=float,
+    )
+    names = np.asarray(
+        [
+            calcUtils.ZernPol(fringe=int(index)).get_polynomial_name(short=True)
+            or f"Fringe {index}"
+            for index in indices
+        ]
+    )
+
+    data.update(
+        {
+            "zernike_phase": zernike_fit["phase"],
+            "zernike_residuals": zernike_fit["residuals"],
+            "zernike_gx_fit": zernike_fit["gx_fit"],
+            "zernike_gy_fit": zernike_fit["gy_fit"],
+            "zernike_valid_mask": zernike_fit["valid_mask"],
+            "zernike_indices": indices,
+            "zernike_names": names,
+            "zernike_coefficients": coefficients,
+            "zernike_coefficients_waves": coefficients_waves,
+            "zernike_residual_rms": zernike_fit["residual_rms"],
+            "zernike_aperture_radius": zernike_fit["aperture"]["radius"],
+            "zernike_aperture_center": zernike_fit["aperture"]["center"],
+        }
+    )
+    return zernike_fit
+
+
+def _build_calibration_metadata(data, log_directory):
+    parameter_keys = (
+        "S",
+        "slm_pitch",
+        "u0",
+        "v0",
+        "roi",
+        "focal_length",
+        "wavelength",
+        "cam_pitch",
+        "eps_px",
+        "max_iter",
+        "settle_s",
+        "discard_frames",
+        "camera_frames",
+        "live_view",
+        "live_every",
+        "skip_gradient_search",
+        "probe_px",
+        "probe_freq",
+        "max_step_px",
+        "damping",
+        "useCorrection",
+    )
+    com_patch = np.asarray(data["com_patch"])
+    valid_patches = np.all(np.isfinite(com_patch), axis=-1)
+    metadata = {
+        "schema_version": 1,
+        "calibration_method": data.get("calibration_method", "wavefront"),
+        "run_directory": log_directory.name,
+        "started_at": data.get("started_at"),
+        "parameters": {
+            key: _json_compatible(data[key])
+            for key in parameter_keys
+            if key in data
+        },
+        "dimensions": {
+            "slm_resolution": list(np.asarray(data["phase"]).shape),
+            "patch_grid": list(np.asarray(data["A_patch"]).shape),
+        },
+        "hardware": {
+            "display_type": data.get("display_type"),
+            "simulated": bool(data.get("is_simulative", False)),
+        },
+        "results": {
+            "valid_patch_count": int(np.count_nonzero(valid_patches)),
+            "total_patch_count": int(valid_patches.size),
+            "reference_com_px": _json_compatible(data["com_ref"]),
+            "reference_power": _json_compatible(data["power_ref"]),
+        },
+    }
+    if "zernike_indices" in data:
+        metadata["zernike_fit"] = {
+            "index_convention": "Fringe",
+            "indices": _json_compatible(data["zernike_indices"]),
+            "names": _json_compatible(data["zernike_names"]),
+            "coefficients_rad": _json_compatible(data["zernike_coefficients"]),
+            "coefficients_waves": _json_compatible(data["zernike_coefficients_waves"]),
+            "gradient_residual_rms_rad_per_m": _json_compatible(
+                data["zernike_residual_rms"]
+            ),
+        }
+    elif "zernike_fit_error" in data:
+        metadata["zernike_fit"] = {"error": str(data["zernike_fit_error"])}
+    return metadata
+
+
+def _save_calibration_outputs(data, log_directory):
+    """Save numerical calibration data and the complete diagnostic plot suite."""
+    convergence = np.asarray(data.get("convergence", []), dtype=float)
+    data["convergence"] = convergence.reshape(-1, 4)
+
+    zernike_fit = _add_zernike_fit(data)
+
+    np.save(log_directory / "phase.npy", data["phase"])
+    np.save(log_directory / "background.npy", data["background_image"])
+    np.save(log_directory / "reference.npy", data["reference_image"])
+    if zernike_fit is not None:
+        np.save(log_directory / "zernike_phase.npy", data["zernike_phase"])
+        calcUtils.saveNpz(
+            {
+                "phase": data["zernike_phase"],
+                "residuals": data["zernike_residuals"],
+                "gx_fit": data["zernike_gx_fit"],
+                "gy_fit": data["zernike_gy_fit"],
+                "valid_mask": data["zernike_valid_mask"],
+                "indices": data["zernike_indices"],
+                "names": data["zernike_names"],
+                "coefficients_rad": data["zernike_coefficients"],
+                "coefficients_waves": data["zernike_coefficients_waves"],
+                "residual_rms": data["zernike_residual_rms"],
+            },
+            log_directory / "zernike_fit.npz",
+        )
+
+    calcUtils.saveNpz(data, log_directory / "data.npz")
+    plot_paths = plotUtils.save_calibration_plots(data, log_directory)
+    shutil.copyfile(plot_paths[0], log_directory / "diagnostics.png")
+    metadata = _build_calibration_metadata(data, log_directory)
+    calcUtils.saveJson(metadata, log_directory / "metadata.json")
+    print(f"Saved calibration data and {len(plot_paths)} plots to {log_directory}")
+
 
 class LiveCalibrationView:
     def __init__(self, cam_extent=None, roi=None):
@@ -359,6 +655,7 @@ class Server:
                 time.sleep(0.01)
 
 
+    @_calibration_run
     def calibrate_wavefront(
         self,
         S="GCD",
@@ -402,6 +699,8 @@ class Server:
         if camera_frames <= 0:
             raise ValueError("camera_frames must be greater than 0.")
 
+        log_directory = self._active_calibration_log_directory
+
         if hasattr(self, "CAM"):
             old_camera_frames = self.CAM.nFrames
             self.CAM.nFrames = camera_frames
@@ -426,21 +725,22 @@ class Server:
         M = P // S
         N = Q // S
 
-        #0. Ordung abziehen
-        # black = np.zeros((Q,P)) +1e-16
-        # self.SLM.showStackedField(field = [black, black]  )
-        
-        # thresh_zerothorder = self.getSettledCamImg(settle_s, discard_frames)
-        
+        # 0. Capture the zeroth-order/background image.
+        black = np.zeros((Q, P)) + 1e-16
+        if self.display_type == "pt3":
+            self.SLM.showStackedField(field=[black, black])
+        else:
+            self.showHologram(black, use_correction=False)
 
-        # if live is not None:
-        #     live.update(
-        #         black,
-        #         thresh_zerothorder,
-        #         "Wavefront calibration - reference patch",
-               
-        #     )
-        # roi = live.select_roi(thresh_zerothorder.shape, roi)
+        thresh_zerothorder = self.getSettledCamImg(settle_s, discard_frames)
+
+        if live is not None:
+            live.update(
+                black,
+                thresh_zerothorder,
+                "Wavefront calibration - background",
+                roi=roi,
+            )
 
 
         # 1. Referenzpunkt: zentrales Patch
@@ -493,13 +793,31 @@ class Server:
         px_to_freq = self.CAM.pitch / (focal_length * self.waveLength)
 
         data = {
+            "calibration_method": "calibrate_wavefront",
+            "started_at": self._active_calibration_metadata["started_at"],
             "S": S,
+            "slm_pitch": slm_pitch,
             "u0": u0,
             "v0": v0,
             "roi": np.asarray(roi),
             "com_ref": com_ref,
             "power_ref": power_ref,
             "skip_gradient_search": skip_gradient_search,
+            "focal_length": focal_length,
+            "wavelength": self.waveLength,
+            "cam_pitch": self.CAM.pitch,
+            "eps_px": eps_px,
+            "max_iter": max_iter,
+            "settle_s": settle_s,
+            "discard_frames": discard_frames,
+            "camera_frames": camera_frames,
+            "live_view": live_view,
+            "live_every": live_every,
+            "display_type": self.display_type,
+            "is_simulative": self.isSimulative,
+            "background_image": thresh_zerothorder,
+            "reference_image": img_ref,
+            "convergence": [],
         }
         data["coms"] = []
         com_patch = np.full((N, M, 2), np.nan, dtype=float)
@@ -519,6 +837,7 @@ class Server:
                 best_alpha_tilde = alpha_tilde
                 best_beta_tilde = beta_tilde
                 best_power = 0.0
+                best_com = None
                 worsening_steps = 0
 
                 iter_count = 1 if skip_gradient_search else max_iter
@@ -559,12 +878,13 @@ class Server:
                     if com is None:
                         break
 
+                    delta_px = com - com_ref
+                    err = np.linalg.norm(delta_px)
+                    data["convergence"].append((m, n, k, err))
+
                     if skip_gradient_search:
                         A_patch[n, m] = np.sqrt(power)
                         break
-
-                    delta_px = com - com_ref
-                    err = np.linalg.norm(delta_px)
 
                     hist.append((alpha_tilde, beta_tilde, delta_px.copy()))
 
@@ -575,6 +895,7 @@ class Server:
                         best_alpha_tilde = alpha_tilde
                         best_beta_tilde = beta_tilde
                         best_power = power
+                        best_com = com.copy()
                         worsening_steps = 0
                     else:
                         worsening_steps += 1
@@ -614,6 +935,9 @@ class Server:
                     best_alphas[n, m] = best_alpha_tilde
                     best_betas[n, m] = best_beta_tilde
                     A_patch[n, m] = np.sqrt(best_power)
+                    power_patch[n, m] = best_power
+                    if best_com is not None:
+                        com_patch[n, m] = best_com
 
                 # final: g_mn = -g_tilde = -2π(alpha_tilde, beta_tilde)
                 gradients[n, m, 0] = -2 * np.pi * alpha_tilde
@@ -654,7 +978,7 @@ class Server:
             data["gx"] = gx_map
             data["gy"] = gy_map
             data["phase"] = phi_map
-            calcUtils.saveNpz(data, "log/data_" + calcUtils.getTimestamp() + ".npz")
+            _save_calibration_outputs(data, log_directory)
             if old_camera_frames is not None:
                 self.CAM.nFrames = old_camera_frames
             return  phi_map, gradients, A_patch 
@@ -681,8 +1005,9 @@ class Server:
         data["gy"] = gy_map
 
         data["phase"] = phi_map
+        data["A_patch"] = A_patch
         
-        calcUtils.saveNpz(data, "log/data_" + calcUtils.getTimestamp() + ".npz")
+        _save_calibration_outputs(data, log_directory)
 
         # np.save("log/gx_map.npy", gx_map)
         # np.save("log/gy_map.npy", gy_map)
@@ -695,6 +1020,7 @@ class Server:
         return phi_map, gradients, A_patch  #A_map, 
     
 
+    @_calibration_run
     def calibrate_wavefront_pt3(
         self,
         S="GCD",
@@ -779,6 +1105,8 @@ class Server:
             raise ValueError("probe_px must be greater than 0.")
         if max_step_px <= 0:
             raise ValueError("max_step_px must be greater than 0.")
+
+        log_directory = self._active_calibration_log_directory
 
         if hasattr(self, "CAM"):
             old_camera_frames = self.CAM.nFrames
@@ -922,6 +1250,8 @@ class Server:
             max_step = max_step_px * px_to_freq
 
             data = {
+                "calibration_method": "calibrate_wavefront_pt3",
+                "started_at": self._active_calibration_metadata["started_at"],
                 "S": (Sx, Sy),
                 "slm_pitch": slm_pitch,
                 "u0": u0,
@@ -934,8 +1264,24 @@ class Server:
                 "probe_freq": probe_freq,
                 "max_step_px": max_step_px,
                 "damping": damping,
+                "useCorrection": useCorrection,
+                "focal_length": focal_length,
+                "wavelength": self.waveLength,
+                "cam_pitch": self.CAM.pitch,
+                "eps_px": eps_px,
+                "max_iter": max_iter,
+                "settle_s": settle_s,
+                "discard_frames": discard_frames,
+                "camera_frames": camera_frames,
+                "live_view": live_view,
+                "live_every": live_every,
+                "display_type": self.display_type,
+                "is_simulative": self.isSimulative,
+                "background_image": thresh_zerothorder,
+                "reference_image": img_ref,
                 "coms": [],
                 "jacobians": [],
+                "convergence": [],
             }
 
             # ------------------------------------------------------------
@@ -973,10 +1319,7 @@ class Server:
                             cam_com=com,
                             patch_center=((m + 0.5) * Sx, (n + 0.5) * Sy),
                         )
-                if com is None: 
-                    delta_px = 0
-                else:
-                    delta_px = com - com_ref
+                delta_px = None if com is None else com - com_ref
                 return delta_px, power, com
 
             # ------------------------------------------------------------
@@ -1003,6 +1346,9 @@ class Server:
                             com_patch[n, m] = com
                             power_patch[n, m] = power
                             A_patch[n, m] = np.sqrt(power)
+                            data["convergence"].append(
+                                (m, n, 0, np.linalg.norm(delta_px))
+                            )
 
                             alpha_tilde = delta_px[0] * px_to_freq
                             beta_tilde = delta_px[1] * px_to_freq
@@ -1038,6 +1384,8 @@ class Server:
                     best_err = np.linalg.norm(delta0)
                     best_p = p.copy()
                     best_power = power0
+                    best_com = com0.copy()
+                    data["convergence"].append((m, n, 0, best_err))
 
                     print(f"initial err: {best_err:.3f}px, delta={delta0}")
 
@@ -1119,6 +1467,7 @@ class Server:
                             break
 
                         err_new = np.linalg.norm(delta_new)
+                        data["convergence"].append((m, n, k + 1, err_new))
 
                         if com_new is not None:
                             com_patch[n, m] = com_new
@@ -1129,6 +1478,7 @@ class Server:
                             best_err = err_new
                             best_p = p_new.copy()
                             best_power = power_new
+                            best_com = com_new.copy()
 
                         if err_new > last_err:
                             worsening_steps += 1
@@ -1158,6 +1508,8 @@ class Server:
                     best_alphas[n, m] = alpha_tilde
                     best_betas[n, m] = beta_tilde
                     A_patch[n, m] = np.sqrt(best_power)
+                    com_patch[n, m] = best_com
+                    power_patch[n, m] = best_power
 
                     gradients[n, m, 0] = -2 * np.pi * alpha_tilde
                     gradients[n, m, 1] = -2 * np.pi * beta_tilde
@@ -1210,7 +1562,7 @@ class Server:
             data["phase"] = phi_map
             data["A_patch"] = A_patch
 
-            calcUtils.saveNpz(data, "log/data_" + calcUtils.getTimestamp() + ".npz")
+            _save_calibration_outputs(data, log_directory)
 
             return phi_map, gradients, A_patch
 
@@ -1492,6 +1844,137 @@ def playground():
     #server.showCamImg()
     # server.showStandardPatches()
 
+
+def save_zernike_phase_from_npz(
+    input_path=None,
+    output_phase_path="log/zernike_phase.npy",
+    output_data_path="log/zernike_fit.npz",
+    slm_pitch=(25e-6, 75e-6),
+    zernike_indices=range(2, 16),
+    aperture_mode="full_slm_diagonal",
+    amplitude_threshold=0.05,
+    regularization=0.0,
+    plot=True,
+):
+    """Load one calibration .npz file, fit Zernikes, and save the fitted phase."""
+    data = calcUtils.loadNpz(input_path)
+
+    if "gradients" not in data:
+        raise KeyError('The selected .npz file must contain data["gradients"].')
+
+    if "phase" in data:
+        resolution = data["phase"].shape
+    elif "gx" in data:
+        resolution = data["gx"].shape
+    else:
+        raise KeyError('The selected .npz file must contain data["phase"] or data["gx"].')
+
+    if "S" not in data:
+        raise KeyError('The selected .npz file must contain data["S"].')
+    S_data = np.asarray(data["S"]).squeeze()
+    if S_data.shape == ():
+        S = int(S_data.item())
+    elif S_data.size == 2:
+        S = tuple(np.ravel(S_data).astype(int))
+    else:
+        raise ValueError('data["S"] must be a scalar or contain two patch-size values.')
+
+    if "slm_pitch" in data:
+        slm_pitch = tuple(np.asarray(data["slm_pitch"], dtype=float).ravel())
+        if len(slm_pitch) == 1:
+            slm_pitch = float(slm_pitch[0])
+        elif len(slm_pitch) != 2:
+            raise ValueError('data["slm_pitch"] must contain one or two values.')
+
+    amplitudes = None
+    if "A_patch" in data:
+        amplitudes = data["A_patch"]
+    elif "power_patch" in data:
+        amplitudes = np.sqrt(np.maximum(data["power_patch"], 0))
+
+    zernike_fit = calcUtils.fit_zernike_from_gradients(
+        data["gradients"],
+        resolution=resolution,
+        patch_size=S,
+        slm_pitch=slm_pitch,
+        zernike_indices=zernike_indices,
+        amplitudes=amplitudes,
+        aperture_mode=aperture_mode,
+        amplitude_threshold=amplitude_threshold if amplitudes is not None else None,
+        regularization=regularization,
+        return_details=True,
+    )
+
+    phase_zernike = zernike_fit["phase"]
+    Path(output_phase_path).parent.mkdir(parents=True, exist_ok=True)
+    np.save(output_phase_path, phase_zernike)
+
+    if output_data_path is not None:
+        calcUtils.saveNpz(
+            {
+                "phase_zernike": phase_zernike,
+                "residuals_zernike": zernike_fit["residuals"],
+                "gx_fit_zernike": zernike_fit["gx_fit"],
+                "gy_fit_zernike": zernike_fit["gy_fit"],
+                "valid_mask_zernike": zernike_fit["valid_mask"],
+                "zernike_indices": np.asarray(zernike_fit["zernike_indices"]),
+                "zernike_coefficients": np.asarray(
+                    [zernike_fit["coefficients"][idx] for idx in zernike_fit["zernike_indices"]]
+                ),
+                "zernike_coefficients_waves": np.asarray(
+                    [zernike_fit["coefficients_waves"][idx] for idx in zernike_fit["zernike_indices"]]
+                ),
+                "residual_rms": np.asarray(zernike_fit["residual_rms"]),
+                "slm_pitch": np.asarray(zernike_fit["aperture"]["slm_pitch"]),
+                "aperture_radius": np.asarray(zernike_fit["aperture"]["radius"]),
+                "aperture_center": np.asarray(zernike_fit["aperture"]["center"]),
+            },
+            output_data_path,
+        )
+
+    print(f"Saved Zernike phase to {output_phase_path}")
+    if output_data_path is not None:
+        print(f"Saved Zernike fit data to {output_data_path}")
+    print(f"Zernike gradient residual RMS: {zernike_fit['residual_rms']:.6e} rad/m")
+    print("Zernike coefficients:")
+    for fringe_index in zernike_fit["zernike_indices"]:
+        coeff = zernike_fit["coefficients"][fringe_index]
+        coeff_waves = zernike_fit["coefficients_waves"][fringe_index]
+        print(f"  fringe {fringe_index:2d}: {coeff: .6e} rad ({coeff_waves: .6e} waves)")
+
+    if plot:
+        gx_measured_map = calcUtils.interpolate_patch_values(
+            data["gradients"][..., 0],
+            resolution[1],
+            resolution[0],
+            S,
+            kind="linear",
+        )
+        gy_measured_map = calcUtils.interpolate_patch_values(
+            data["gradients"][..., 1],
+            resolution[1],
+            resolution[0],
+            S,
+            kind="linear",
+        )
+        residual_mag = np.sqrt(
+            zernike_fit["residuals"][..., 0] ** 2
+            + zernike_fit["residuals"][..., 1] ** 2
+        )
+
+        plotUtils.plot_wavefront(phase_zernike, title="Zernike phase")
+        plotUtils.plot_phase_gradient(
+            phase_zernike,
+            gx_measured_map,
+            gy_measured_map,
+            title="Zernike phase with measured gradients",
+        )
+        plotUtils.plot_camImg(residual_mag, title="Zernike gradient residual magnitude")
+        plt.show()
+
+    return phase_zernike, zernike_fit
+
+
 def testCorrection():
     server = Server("pt3", False, False)
 
@@ -1531,6 +2014,7 @@ if __name__ == "__main__":
     # server.mosaic = calcUtils.make_patch_mosaic_mask(data["best_alphas"], data["best_betas"],
     #                                                  data["S"], server.SLM.pitch, data["u0"], data["v0"], server.SLM.resolution)
 
+    # save_zernike_phase_from_npz(output_phase_path="log/zernike_phase.npy")
     playground()
     # plt.show()
 

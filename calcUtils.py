@@ -380,13 +380,13 @@ def _zernike_normalized_coordinates(x, y, rx, ry):
     u = x / rx
     v = y / ry
     rho = np.hypot(u, v)
-    theta = np.arctan2(v, u)
+    theta = np.mod(np.arctan2(v, u), 2 * np.pi)
     return u, v, rho, theta
 
 
 def _zernike_fringe_value(fringe_index, u, v):
     rho = np.hypot(u, v)
-    theta = np.arctan2(v, u)
+    theta = np.mod(np.arctan2(v, u), 2 * np.pi)
     return np.asarray(ZernPol(fringe=int(fringe_index)).polynomial_value(rho, theta), dtype=float)
 
 
@@ -1598,6 +1598,24 @@ def saveNpz(data, path):
     np.savez_compressed(output_path, **data)
 
 
+def createCalibrationLogDir(log_root="log"):
+    """Create and return a unique log directory for one calibration run."""
+    log_root = Path(log_root)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base_name = f"calibration_{timestamp}"
+
+    for suffix in range(1000):
+        directory_name = base_name if suffix == 0 else f"{base_name}_{suffix:02d}"
+        log_directory = log_root / directory_name
+        try:
+            log_directory.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue
+        return log_directory
+
+    raise RuntimeError(f"Could not create a unique calibration log directory in {log_root}.")
+
+
 def loadNpz(path=None):
     """Load a NumPy archive into a plain dictionary.
 
@@ -1748,6 +1766,13 @@ if __name__ == "__main__":
         gx_zernike,
         gy_zernike,
         title="Zernike fitted phase gradient",
+    )
+
+    plotUtils.plot_phase_gradient(
+        phase_zernike,
+        gx_raw,
+        gy_raw,
+        title="Zernike phase with measured gradients",
     )
     plotUtils.plot_camImg(
         residuals_zernike[..., 0],
