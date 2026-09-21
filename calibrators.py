@@ -257,6 +257,14 @@ def _build_calibration_metadata(data, log_directory):
         "max_step_px",
         "damping",
         "useCorrection",
+        "separate_amplitude_measurement",
+        "amplitude_exposure_min_us",
+        "amplitude_exposure_max_us",
+        "amplitude_target_low",
+        "amplitude_target_high",
+        "amplitude_exposure_factor",
+        "amplitude_max_attempts",
+        "amplitude_saturation_value",
     )
     com_patch = np.asarray(data["com_patch"])
     valid_patches = np.all(np.isfinite(com_patch), axis=-1)
@@ -285,6 +293,17 @@ def _build_calibration_metadata(data, log_directory):
             "reference_power": _json_compatible(data["power_ref"]),
         },
     }
+    if data.get("separate_amplitude_measurement", False):
+        amplitude_valid = np.asarray(
+            data.get("amplitude_measurement_valid", []),
+            dtype=bool,
+        )
+        metadata["results"]["valid_amplitude_measurement_count"] = int(
+            np.count_nonzero(amplitude_valid)
+        )
+        metadata["results"]["patch_power_unit"] = "a.u./us"
+    else:
+        metadata["results"]["patch_power_unit"] = "a.u."
     if "zernike_indices" in data:
         metadata["zernike_fit"] = {
             "index_convention": "Fringe",
@@ -312,7 +331,19 @@ def _save_calibration_outputs(data, log_directory):
     np.save(log_directory / "background.npy", data["background_image"])
     np.save(log_directory / "reference.npy", data["reference_image"])
     calcUtils.saveNpz(
-        {"A_patch": np.asarray(data["A_patch"], dtype=float)},
+        {
+            key: np.asarray(data[key])
+            for key in (
+                "A_patch",
+                "power_patch",
+                "amplitude_power_raw",
+                "amplitude_exposure_us",
+                "amplitude_peak_fraction",
+                "amplitude_saturation_fraction",
+                "amplitude_measurement_valid",
+            )
+            if key in data
+        },
         log_directory / "A_patch.npz",
     )
     if zernike_fit is not None:
@@ -1092,7 +1123,15 @@ class Server:
         probe_px=20.0,
         max_step_px=300.0,
         damping=1,
-        useCorrection = False
+        useCorrection=False,
+        separate_amplitude_measurement=True,
+        amplitude_exposure_min_us=50.0,
+        amplitude_exposure_max_us=1_000_000.0,
+        amplitude_target_low=0.10,
+        amplitude_target_high=0.85,
+        amplitude_exposure_factor=4.0,
+        amplitude_max_attempts=8,
+        amplitude_saturation_value=None,
         ):
         """
         Wavefront-Kalibration mit gemessener lokaler 2x2-Jacobi-Matrix.
@@ -1109,6 +1148,10 @@ class Server:
             wird über eine 2x2-Jacobi-Matrix berücksichtigt.
             - Die Jacobi-Matrix wird während der Iteration per Broyden-Update
             verbessert.
+            - Mit separate_amplitude_measurement=True wird nach dem Finden des
+            finalen Patch-Gradienten eine adaptive, hintergrundkorrigierte und
+            auf die Belichtungszeit normierte Amplitudenmessung ausgeführt.
+              False verwendet wie bisher die Leistung aus der Positionssuche.
         """
 
         import time
@@ -1138,6 +1181,7 @@ class Server:
             return _limited_step(step, max_step)
 
         old_camera_frames = None
+        old_integration_time = None
         if useCorrection:
             correctionPhase = np.load("log/wavefrontmap_pt3.npy")
 
@@ -1156,12 +1200,32 @@ class Server:
             raise ValueError("probe_px must be greater than 0.")
         if max_step_px <= 0:
             raise ValueError("max_step_px must be greater than 0.")
+        if amplitude_exposure_min_us <= 0:
+            raise ValueError("amplitude_exposure_min_us must be greater than 0.")
+        if amplitude_exposure_max_us < amplitude_exposure_min_us:
+            raise ValueError(
+                "amplitude_exposure_max_us must be greater than or equal to "
+                "amplitude_exposure_min_us."
+            )
+        if not 0 < amplitude_target_low < amplitude_target_high < 1:
+            raise ValueError(
+                "Amplitude target fractions must satisfy "
+                "0 < low < high < 1."
+            )
+        if amplitude_exposure_factor <= 1:
+            raise ValueError("amplitude_exposure_factor must be greater than 1.")
+        if amplitude_max_attempts <= 0:
+            raise ValueError("amplitude_max_attempts must be greater than 0.")
+        if amplitude_saturation_value is not None and amplitude_saturation_value <= 0:
+            raise ValueError("amplitude_saturation_value must be greater than 0.")
 
         log_directory = self._active_calibration_log_directory
 
         if hasattr(self, "CAM"):
             old_camera_frames = self.CAM.nFrames
             self.CAM.nFrames = camera_frames
+            if hasattr(self.CAM, "get_integration_time"):
+                old_integration_time = self.CAM.get_integration_time()
 
         try:
             roi = _normalize_roi(roi)
@@ -1216,17 +1280,23 @@ class Server:
             # self.showHologram(p0, a0)
             # input()
 
-            thresh_zerothorder = self.getSettledCamImg(settle_s, discard_frames)
+            background_image = np.asarray(
+                self.getSettledCamImg(settle_s, discard_frames),
+                dtype=float,
+            )
 
             
 
             if live is not None:
                 live.update(
                     black,
-                    thresh_zerothorder,
+                    background_image,
                     "Wavefront calibration - background",
                 )
-                roi = live.select_roi(thresh_zerothorder.shape, roi)
+                roi = live.select_roi(background_image.shape, roi)
+            # Preserve the established position-calibration behaviour. The
+            # separately measured amplitudes below use an exposure-specific
+            # background image instead.
             thresh_zerothorder = 0
             # ------------------------------------------------------------
             # 1. Referenzpatch
@@ -1294,6 +1364,11 @@ class Server:
             power_patch = np.zeros((N, M), dtype=float)
             best_alphas = np.full((N, M), np.nan, dtype=float)
             best_betas = np.full((N, M), np.nan, dtype=float)
+            amplitude_power_raw = np.full((N, M), np.nan, dtype=float)
+            amplitude_exposure_us = np.full((N, M), np.nan, dtype=float)
+            amplitude_peak_fraction = np.full((N, M), np.nan, dtype=float)
+            amplitude_saturation_fraction = np.full((N, M), np.nan, dtype=float)
+            amplitude_measurement_valid = np.zeros((N, M), dtype=bool)
 
             px_to_freq = self.CAM.pitch / (focal_length * self.waveLength)
 
@@ -1316,6 +1391,18 @@ class Server:
                 "max_step_px": max_step_px,
                 "damping": damping,
                 "useCorrection": useCorrection,
+                "separate_amplitude_measurement": separate_amplitude_measurement,
+                "amplitude_exposure_min_us": amplitude_exposure_min_us,
+                "amplitude_exposure_max_us": amplitude_exposure_max_us,
+                "amplitude_target_low": amplitude_target_low,
+                "amplitude_target_high": amplitude_target_high,
+                "amplitude_exposure_factor": amplitude_exposure_factor,
+                "amplitude_max_attempts": amplitude_max_attempts,
+                "amplitude_saturation_value": (
+                    "auto"
+                    if amplitude_saturation_value is None
+                    else float(amplitude_saturation_value)
+                ),
                 "focal_length": focal_length,
                 "wavelength": self.waveLength,
                 "cam_pitch": self.CAM.pitch,
@@ -1328,11 +1415,16 @@ class Server:
                 "live_every": live_every,
                 "display_type": self.display_type,
                 "is_simulative": self.isSimulative,
-                "background_image": thresh_zerothorder,
+                "background_image": background_image,
                 "reference_image": img_ref,
                 "coms": [],
                 "jacobians": [],
                 "convergence": [],
+                "amplitude_power_raw": amplitude_power_raw,
+                "amplitude_exposure_us": amplitude_exposure_us,
+                "amplitude_peak_fraction": amplitude_peak_fraction,
+                "amplitude_saturation_fraction": amplitude_saturation_fraction,
+                "amplitude_measurement_valid": amplitude_measurement_valid,
             }
 
             # ------------------------------------------------------------
@@ -1373,6 +1465,232 @@ class Server:
                 delta_px = None if com is None else com - com_ref
                 return delta_px, power, com
 
+            amplitude_background_cache = {}
+
+            def _set_amplitude_exposure(exposure_us):
+                if not hasattr(self.CAM, "set_integration_time"):
+                    raise RuntimeError(
+                        "Separate amplitude measurement requires a camera with "
+                        "set_integration_time()."
+                    )
+                self.CAM.set_integration_time(float(exposure_us))
+                if hasattr(self.CAM, "get_integration_time"):
+                    return float(self.CAM.get_integration_time())
+                return float(exposure_us)
+
+            def _get_amplitude_background(exposure_us):
+                actual_exposure = _set_amplitude_exposure(exposure_us)
+                cache_key = round(actual_exposure, 6)
+                if cache_key not in amplitude_background_cache:
+                    self.SLM.showStackedField(field=[black, black])
+                    background = np.asarray(
+                        self.getSettledCamImg(settle_s, discard_frames),
+                        dtype=float,
+                    )
+                    if background.ndim != 2:
+                        raise ValueError(
+                            "Expected a 2D amplitude-background image, got "
+                            f"shape {background.shape}."
+                        )
+                    amplitude_background_cache[cache_key] = background
+                return actual_exposure, amplitude_background_cache[cache_key]
+
+            def _measure_final_amplitude(m, n, alpha_tilde, beta_tilde):
+                """Measure one final patch with adaptive, exposure-normalized power."""
+                if old_integration_time is None:
+                    raise RuntimeError(
+                        "The camera exposure cannot be read. Separate amplitude "
+                        "measurement cannot restore the position-calibration exposure."
+                    )
+
+                phase, amp = calcUtils.make_patch_ramp(
+                    P, Q,
+                    (Sx, Sy),
+                    m, n,
+                    u0 - alpha_tilde,
+                    v0 - beta_tilde,
+                    slm_pitch,
+                )
+                if useCorrection:
+                    phase = (phase + correctionPhase) % (2 * np.pi)
+
+                exposure_us = float(
+                    np.clip(
+                        old_integration_time,
+                        amplitude_exposure_min_us,
+                        amplitude_exposure_max_us,
+                    )
+                )
+                best_unsaturated = None
+                selected = None
+
+                try:
+                    for attempt in range(amplitude_max_attempts):
+                        actual_exposure, amplitude_background = _get_amplitude_background(
+                            exposure_us
+                        )
+                        self.showHologram(phase, amp)
+                        raw_image = np.asarray(
+                            self.getSettledCamImg(settle_s, discard_frames),
+                            dtype=float,
+                        )
+                        if raw_image.ndim != 2:
+                            raise ValueError(
+                                "Expected a 2D amplitude image, got "
+                                f"shape {raw_image.shape}."
+                            )
+                        if raw_image.shape != amplitude_background.shape:
+                            raise ValueError(
+                                "Amplitude image and background image have different "
+                                f"shapes: {raw_image.shape} and "
+                                f"{amplitude_background.shape}."
+                            )
+
+                        corrected_image = np.clip(
+                            raw_image - amplitude_background,
+                            0,
+                            None,
+                        )
+                        y0, y1, x0, x1 = roi
+                        raw_crop = raw_image[y0:y1, x0:x1]
+                        corrected_crop = corrected_image[y0:y1, x0:x1]
+
+                        saturation_value = amplitude_saturation_value
+                        if saturation_value is None and hasattr(
+                            self.CAM, "get_saturation_value"
+                        ):
+                            saturation_value = self.CAM.get_saturation_value()
+                        if saturation_value is None:
+                            saturation_value = 255.0
+                        saturation_value = float(saturation_value)
+
+                        raw_peak_fraction = float(
+                            np.max(raw_crop) / saturation_value
+                        )
+                        signal_peak_fraction = float(
+                            np.max(corrected_crop) / saturation_value
+                        )
+                        saturation_fraction = float(
+                            np.mean(raw_crop >= 0.98 * saturation_value)
+                        )
+                        _, raw_power = calcUtils.spot_com_and_power(
+                            corrected_image,
+                            roi,
+                            power_in_mask=True,
+                        )
+
+                        candidate = {
+                            "power_raw": float(raw_power),
+                            "power_normalized": float(raw_power / actual_exposure),
+                            "exposure_us": actual_exposure,
+                            "peak_fraction": raw_peak_fraction,
+                            "signal_peak_fraction": signal_peak_fraction,
+                            "saturation_fraction": saturation_fraction,
+                            "image": corrected_image,
+                            "phase": phase,
+                        }
+                        is_unsaturated = saturation_fraction == 0.0
+                        if is_unsaturated and (
+                            best_unsaturated is None
+                            or signal_peak_fraction
+                            > best_unsaturated["signal_peak_fraction"]
+                        ):
+                            best_unsaturated = candidate
+
+                        print(
+                            f"Amplitude patch ({m},{n}) attempt {attempt + 1}: "
+                            f"exposure={actual_exposure:.1f} us, "
+                            f"signal peak={100 * signal_peak_fraction:.1f}%, "
+                            f"saturated pixels={100 * saturation_fraction:.4f}%"
+                        )
+
+                        if (
+                            is_unsaturated
+                            and amplitude_target_low <= signal_peak_fraction
+                            <= amplitude_target_high
+                        ):
+                            candidate["valid"] = True
+                            selected = candidate
+                            break
+
+                        if (
+                            not is_unsaturated
+                            or raw_peak_fraction > amplitude_target_high
+                        ):
+                            next_exposure = max(
+                                amplitude_exposure_min_us,
+                                actual_exposure / amplitude_exposure_factor,
+                            )
+                        else:
+                            next_exposure = min(
+                                amplitude_exposure_max_us,
+                                actual_exposure * amplitude_exposure_factor,
+                            )
+
+                        if np.isclose(next_exposure, actual_exposure):
+                            break
+                        exposure_us = next_exposure
+
+                    if selected is None and best_unsaturated is not None:
+                        best_unsaturated["valid"] = False
+                        selected = best_unsaturated
+                    return selected
+                finally:
+                    _set_amplitude_exposure(old_integration_time)
+
+            def _store_patch_amplitude(
+                m,
+                n,
+                alpha_tilde,
+                beta_tilde,
+                fallback_power,
+            ):
+                if not separate_amplitude_measurement:
+                    power_patch[n, m] = fallback_power
+                    A_patch[n, m] = np.sqrt(max(fallback_power, 0.0))
+                    amplitude_power_raw[n, m] = fallback_power
+                    amplitude_exposure_us[n, m] = (
+                        np.nan
+                        if old_integration_time is None
+                        else old_integration_time
+                    )
+                    amplitude_measurement_valid[n, m] = np.isfinite(fallback_power)
+                    return
+
+                result = _measure_final_amplitude(
+                    m,
+                    n,
+                    alpha_tilde,
+                    beta_tilde,
+                )
+                if result is None:
+                    print(
+                        f"Amplitude patch ({m},{n}) invalid: no unsaturated "
+                        "measurement was available."
+                    )
+                    power_patch[n, m] = 0.0
+                    A_patch[n, m] = 0.0
+                    return
+
+                power_patch[n, m] = result["power_normalized"]
+                A_patch[n, m] = np.sqrt(max(result["power_normalized"], 0.0))
+                amplitude_power_raw[n, m] = result["power_raw"]
+                amplitude_exposure_us[n, m] = result["exposure_us"]
+                amplitude_peak_fraction[n, m] = result["peak_fraction"]
+                amplitude_saturation_fraction[n, m] = result[
+                    "saturation_fraction"
+                ]
+                amplitude_measurement_valid[n, m] = result["valid"]
+
+                if live is not None:
+                    live.update(
+                        result["phase"],
+                        result["image"],
+                        f"Wavefront calibration - patch ({m}, {n}) amplitude",
+                        patch_center=((m + 0.5) * Sx, (n + 0.5) * Sy),
+                        roi=roi,
+                    )
+
             # ------------------------------------------------------------
             # 2. Patch scanning
             # ------------------------------------------------------------
@@ -1395,8 +1713,6 @@ class Server:
 
                         if com is not None:
                             com_patch[n, m] = com
-                            power_patch[n, m] = power
-                            A_patch[n, m] = np.sqrt(power)
                             data["convergence"].append(
                                 (m, n, 0, np.linalg.norm(delta_px))
                             )
@@ -1406,6 +1722,15 @@ class Server:
 
                             gradients[n, m, 0] = -2 * np.pi * alpha_tilde
                             gradients[n, m, 1] = -2 * np.pi * beta_tilde
+                            best_alphas[n, m] = alpha_tilde
+                            best_betas[n, m] = beta_tilde
+                            _store_patch_amplitude(
+                                m,
+                                n,
+                                alpha_tilde,
+                                beta_tilde,
+                                power,
+                            )
 
                         continue
 
@@ -1442,11 +1767,17 @@ class Server:
 
                     if best_err <= eps_px:
                         alpha_tilde, beta_tilde = best_p
-                        A_patch[n, m] = np.sqrt(best_power)
                         gradients[n, m, 0] = -2 * np.pi * alpha_tilde
                         gradients[n, m, 1] = -2 * np.pi * beta_tilde
                         best_alphas[n, m] = alpha_tilde
                         best_betas[n, m] = beta_tilde
+                        _store_patch_amplitude(
+                            m,
+                            n,
+                            alpha_tilde,
+                            beta_tilde,
+                            best_power,
+                        )
                         continue
 
                     # ----------------------------------------------------
@@ -1558,12 +1889,18 @@ class Server:
                     alpha_tilde, beta_tilde = best_p
                     best_alphas[n, m] = alpha_tilde
                     best_betas[n, m] = beta_tilde
-                    A_patch[n, m] = np.sqrt(best_power)
                     com_patch[n, m] = best_com
-                    power_patch[n, m] = best_power
 
                     gradients[n, m, 0] = -2 * np.pi * alpha_tilde
                     gradients[n, m, 1] = -2 * np.pi * beta_tilde
+
+                    _store_patch_amplitude(
+                        m,
+                        n,
+                        alpha_tilde,
+                        beta_tilde,
+                        best_power,
+                    )
 
                     print(
                         f"best patch ({m},{n}): "
@@ -1620,6 +1957,8 @@ class Server:
         finally:
             if old_camera_frames is not None:
                 self.CAM.nFrames = old_camera_frames
+            if old_integration_time is not None:
+                self.CAM.set_integration_time(old_integration_time)
 
     def testU0_v0(self):
 

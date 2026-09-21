@@ -250,6 +250,11 @@ def _save_calibration_figure(fig, output_path, dpi):
 
 def _plot_calibration_image(ax, image, title, colorbar_label=None, cmap="viridis"):
     """Add a consistently formatted image and colorbar to an axes."""
+    image = np.asarray(image)
+    if image.ndim != 2:
+        raise ValueError(
+            f"Expected a 2D image for '{title}', got shape {image.shape}."
+        )
     im = ax.imshow(image, cmap=cmap, origin="lower", aspect="auto")
     ax.set_title(title)
     ax.set_xlabel("x index")
@@ -295,7 +300,19 @@ def save_calibration_plots(data, log_directory, dpi=250):
     spot_error = np.where(valid_spots, np.linalg.norm(spot_delta, axis=-1), np.nan)
     gradient_magnitude = np.hypot(gx, gy)
     wrapped_phase = np.mod(phase, 2 * np.pi)
-    invalid_patches = (~valid_spots).astype(float)
+    amplitude_valid = np.asarray(
+        data.get("amplitude_measurement_valid", valid_spots),
+        dtype=bool,
+    )
+    if amplitude_valid.shape != amplitude.shape:
+        amplitude_valid = valid_spots.copy()
+    invalid_patches = (
+        ~valid_spots
+        | (
+            bool(data.get("separate_amplitude_measurement", False))
+            & ~amplitude_valid
+        )
+    ).astype(float)
     saved_paths = []
 
     # 01: Compact overview
@@ -304,7 +321,12 @@ def save_calibration_plots(data, log_directory, dpi=250):
     _plot_calibration_image(axes[0, 1], gx, "x phase gradient", "Gradient [rad/m]")
     _plot_calibration_image(axes[0, 2], gy, "y phase gradient", "Gradient [rad/m]")
     _plot_calibration_image(axes[1, 0], amplitude, "Normalized patch amplitude", "Relative amplitude")
-    _plot_calibration_image(axes[1, 1], power, "Patch power", "Power [a.u.]")
+    power_label = (
+        "Power rate [a.u./us]"
+        if data.get("separate_amplitude_measurement", False)
+        else "Power [a.u.]"
+    )
+    _plot_calibration_image(axes[1, 1], power, "Patch power", power_label)
     _plot_calibration_image(axes[1, 2], spot_error, "Final spot error", "Error [px]", "magma")
     fig.suptitle("Wavefront calibration summary", fontsize=16)
     output_path = plots_directory / "01_summary.png"
@@ -318,13 +340,17 @@ def save_calibration_plots(data, log_directory, dpi=250):
         (background, "Camera background"),
         (reference, "Reference spot image"),
     ]
-    available_images = [(image, title) for image, title in camera_images if image is not None]
+    available_images = [
+        (np.asarray(image), title)
+        for image, title in camera_images
+        if image is not None and np.asarray(image).ndim == 2
+    ]
     if available_images:
         fig, axes = plt.subplots(1, len(available_images), figsize=(7 * len(available_images), 6))
         axes = np.atleast_1d(axes)
         roi = np.asarray(data.get("roi", []), dtype=float)
         for ax, (image, title) in zip(axes, available_images):
-            _plot_calibration_image(ax, np.asarray(image), title, "Intensity [a.u.]", "nipy_spectral")
+            _plot_calibration_image(ax, image, title, "Intensity [a.u.]", "nipy_spectral")
             if roi.shape == (4,):
                 y0, y1, x0, x1 = roi
                 ax.add_patch(
@@ -405,7 +431,7 @@ def save_calibration_plots(data, log_directory, dpi=250):
     # 05: Patch signal quality and invalid measurements
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     _plot_calibration_image(axes[0], amplitude, "Normalized patch amplitude", "Relative amplitude")
-    _plot_calibration_image(axes[1], power, "Measured patch power", "Power [a.u.]")
+    _plot_calibration_image(axes[1], power, "Measured patch power", power_label)
     im = axes[2].imshow(invalid_patches, cmap="gray_r", origin="lower", vmin=0, vmax=1, aspect="auto")
     axes[2].set_title("Invalid or skipped patches")
     axes[2].set_xlabel("Patch x index")
@@ -613,5 +639,65 @@ def save_calibration_plots(data, log_directory, dpi=250):
     output_path = plots_directory / "09_patch_amplitude.png"
     _save_calibration_figure(fig, output_path, dpi)
     saved_paths.append(output_path)
+
+    # 10: Adaptive exposure diagnostics for the separate amplitude pass
+    if data.get("separate_amplitude_measurement", False):
+        exposure = np.asarray(data.get("amplitude_exposure_us", []), dtype=float)
+        peak_fraction = np.asarray(
+            data.get("amplitude_peak_fraction", []),
+            dtype=float,
+        )
+        saturation_fraction = np.asarray(
+            data.get("amplitude_saturation_fraction", []),
+            dtype=float,
+        )
+        if (
+            exposure.shape == amplitude.shape
+            and peak_fraction.shape == amplitude.shape
+            and saturation_fraction.shape == amplitude.shape
+        ):
+            fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+            _plot_calibration_image(
+                axes[0, 0],
+                exposure,
+                "Selected exposure time",
+                "Exposure [us]",
+            )
+            _plot_calibration_image(
+                axes[0, 1],
+                100 * peak_fraction,
+                "Raw peak level",
+                "Full scale [%]",
+                "magma",
+            )
+            _plot_calibration_image(
+                axes[1, 0],
+                100 * saturation_fraction,
+                "Saturated pixel fraction",
+                "ROI pixels [%]",
+                "magma",
+            )
+            validity_image = amplitude_valid.astype(float)
+            im = axes[1, 1].imshow(
+                validity_image,
+                cmap="RdYlGn",
+                origin="lower",
+                vmin=0,
+                vmax=1,
+                aspect="auto",
+            )
+            axes[1, 1].set_title("Amplitude measurement validity")
+            axes[1, 1].set_xlabel("Patch x index")
+            axes[1, 1].set_ylabel("Patch y index")
+            fig.colorbar(
+                im,
+                ax=axes[1, 1],
+                ticks=[0, 1],
+                label="0 = outside target, 1 = valid",
+            )
+            fig.suptitle("Adaptive amplitude measurement", fontsize=16)
+            output_path = plots_directory / "10_amplitude_exposure.png"
+            _save_calibration_figure(fig, output_path, dpi)
+            saved_paths.append(output_path)
 
     return saved_paths

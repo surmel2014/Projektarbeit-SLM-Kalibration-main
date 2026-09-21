@@ -945,7 +945,7 @@ def compute_patch_size_for_physical_square(
     }
 
 
-def spot_com_and_power(image, roi):
+def spot_com_and_power(image, roi, power_in_mask=False):
     """
     roi = (y0, y1, x0, x1)
     COM wird nach Otsu-Segmentierung berechnet.
@@ -965,7 +965,7 @@ def spot_com_and_power(image, roi):
 
     com_x = x0 + cx
     com_y = y0 + cy
-    power = crop.sum()
+    power = weighted.sum() if power_in_mask else crop.sum()
     return np.array([com_x, com_y]), power
 
 

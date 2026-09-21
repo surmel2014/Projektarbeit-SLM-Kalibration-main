@@ -300,6 +300,8 @@ class CAM:
         self.img_buffer = None
 
         self.nFrames = 5
+        self._integration_time_micros = 500.0
+        self._last_frame_saturation_value = 255.0
         
         self.simImg = None
         self.simExtent = None
@@ -332,8 +334,31 @@ class CAM:
             self.cam.stop_acquisition()
             return image.shape
 
-    def set_integration_time(self,time_micros):
-        self.cam.set_exposure(time_micros)
+    def set_integration_time(self, time_micros):
+        """Set and remember the camera exposure time in microseconds."""
+        time_micros = float(time_micros)
+        if time_micros <= 0:
+            raise ValueError("The integration time must be greater than zero.")
+        if not self.isSimulative:
+            self.cam.set_exposure(int(round(time_micros)))
+            try:
+                time_micros = float(self.cam.get_exposure())
+            except (AttributeError, TypeError, ValueError):
+                pass
+        self._integration_time_micros = time_micros
+
+    def get_integration_time(self):
+        """Return the current camera exposure time in microseconds."""
+        if not self.isSimulative:
+            try:
+                self._integration_time_micros = float(self.cam.get_exposure())
+            except (AttributeError, TypeError, ValueError):
+                pass
+        return self._integration_time_micros
+
+    def get_saturation_value(self):
+        """Return the digital full-scale value of the most recent raw frame."""
+        return self._last_frame_saturation_value
         
     
     def __del__(self):
@@ -348,6 +373,12 @@ class CAM:
     
     def getCamImg(self):
         if self.isSimulative:
+            if self.simImg is not None:
+                sim_dtype = np.asarray(self.simImg).dtype
+                if np.issubdtype(sim_dtype, np.integer):
+                    self._last_frame_saturation_value = float(np.iinfo(sim_dtype).max)
+                elif np.nanmax(self.simImg) <= 1.0:
+                    self._last_frame_saturation_value = 1.0
             return self.simImg
         
         img_ls = []
@@ -356,6 +387,8 @@ class CAM:
             
             self.cam.get_image(self.img_buffer)
             image = self.img_buffer.get_image_data_numpy()
+            if np.issubdtype(image.dtype, np.integer):
+                self._last_frame_saturation_value = float(np.iinfo(image.dtype).max)
             #image_flip = np.flip( np.flip( image, 0), 1)
             self.cam.stop_acquisition()
             img_ls.append(image)
