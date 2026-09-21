@@ -800,6 +800,46 @@ def make_patch_ramp(P, Q, S, m, n, u_eff, v_eff, slm_pitch):
     return wrap_phase(phase), amp
 
 
+def make_centered_patch_ramp(P, Q, S, u_eff, v_eff, slm_pitch):
+    """Create a ramp patch centered on the SLM, independently of the patch grid.
+
+    Unlike :func:`make_patch_ramp`, the patch position is not derived from a
+    patch index. This is intended for the calibration reference patch, which
+    must remain centered even when the regular patch grid has an even number
+    of rows or columns. Returns ``(phase, amplitude, center)``; ``center`` uses
+    the same pixel-boundary coordinate convention as the calibration view.
+    """
+    P = int(P)
+    Q = int(Q)
+    Sx, Sy = _normalize_patch_size(S, "S")
+    if P <= 0 or Q <= 0:
+        raise ValueError("P and Q must be greater than 0.")
+    if Sx > P or Sy > Q:
+        raise ValueError("S must not be larger than the SLM resolution.")
+
+    # Center the aperture itself instead of selecting a nominally central
+    # member of the regular measurement grid. For a parity mismatch between
+    # display and patch, half-pixel-perfect centering is physically impossible;
+    # integer slicing then chooses the lower/left of the two equivalent pixels.
+    x0 = (P - Sx) // 2
+    y0 = (Q - Sy) // 2
+    x1 = x0 + Sx
+    y1 = y0 + Sy
+
+    phase = np.zeros((Q, P), dtype=np.float32)
+    amp = np.zeros((Q, P), dtype=np.float32)
+
+    x_pitch, y_pitch = _normalize_pixel_pitch(slm_pitch, "slm_pitch")
+    xs = (np.arange(x0, x1) - (x0 + x1 - 1) / 2) * x_pitch
+    ys = (np.arange(y0, y1) - (y0 + y1 - 1) / 2) * y_pitch
+    X, Y = np.meshgrid(xs, ys)
+
+    phase[y0:y1, x0:x1] = 2 * np.pi * (X * u_eff + Y * v_eff)
+    amp[y0:y1, x0:x1] = 1
+    center = ((x0 + x1) / 2, (y0 + y1) / 2)
+    return wrap_phase(phase), amp, center
+
+
 def make_full_display_patch(resolution, u0, v0, slm_pitch):
     """Create one ramp patch spanning the full display."""
     Q, P = resolution

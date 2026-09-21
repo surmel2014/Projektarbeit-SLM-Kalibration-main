@@ -294,6 +294,9 @@ def _build_calibration_metadata(data, log_directory):
             "total_patch_count": int(valid_patches.size),
             "reference_com_px": _json_compatible(data["com_ref"]),
             "reference_power": _json_compatible(data["power_ref"]),
+            "reference_patch_center_px": _json_compatible(
+                data.get("reference_patch_center")
+            ),
         },
     }
     if data.get("separate_amplitude_measurement", False):
@@ -749,10 +752,11 @@ class Server:
         M = P // S
         N = Q // S
 
-        # 1. Referenzpunkt: zentrales Patch
-        m_ref, n_ref = M // 2, N // 2
-        phase_ref = calcUtils.make_patch_ramp(P, Q, S, m_ref, n_ref, u0, v0, slm_pitch)
-        self.showHologram(phase_ref)
+        # 1. Referenzpunkt: unabhängig vom Messraster exakt zentriertes Patch
+        phase_ref, amp_ref, _ = calcUtils.make_centered_patch_ramp(
+            P, Q, S, u0, v0, slm_pitch
+        )
+        self.showHologram(phase_ref, amp_ref)
         time.sleep(0.01)
 
         for n in range(N):
@@ -869,9 +873,12 @@ class Server:
             )
 
 
-        # 1. Referenzpunkt: zentrales Patch
-        m_ref, n_ref = M // 2, N // 2
-        phase_ref, amp_ref = calcUtils.make_patch_ramp(P, Q, S, m_ref, n_ref, u0, v0, slm_pitch)
+        # 1. Referenzpunkt: unabhängig vom Messraster exakt zentriertes Patch
+        phase_ref, amp_ref, reference_patch_center = (
+            calcUtils.make_centered_patch_ramp(
+                P, Q, S, u0, v0, slm_pitch
+            )
+        )
    
         self.showHologram(phase_ref, amp_ref)
         
@@ -882,7 +889,7 @@ class Server:
                     phase_ref,
                     img_ref,
                     "Wavefront calibration - reference patch",
-                    patch_center=((m_ref + 0.5) * S, (n_ref + 0.5) * S),
+                    patch_center=reference_patch_center,
                     roi=roi,
                 )
                 roi = live.select_roi(img_ref.shape, roi)
@@ -903,7 +910,7 @@ class Server:
                         img_ref,
                         "Wavefront calibration - reference patch",
                         cam_com=com_ref,
-                        patch_center=((m_ref + 0.5) * S, (n_ref + 0.5) * S),
+                        patch_center=reference_patch_center,
                         cam_ref_com=com_ref,
                         roi=roi,
                     )
@@ -928,6 +935,7 @@ class Server:
             "roi": np.asarray(roi),
             "com_ref": com_ref,
             "power_ref": power_ref,
+            "reference_patch_center": reference_patch_center,
             "skip_gradient_search": skip_gradient_search,
             "focal_length": focal_length,
             "wavelength": self.waveLength,
@@ -1563,16 +1571,15 @@ class Server:
                 return selected
 
             # ------------------------------------------------------------
-            # 1. Referenzpatch
+            # 1. Referenzpatch: unabhängig vom Messraster exakt zentriert
             # ------------------------------------------------------------
-            m_ref, n_ref = M // 2, N // 2
-
-            phase_ref, amp_ref = calcUtils.make_patch_ramp(
-                P, Q,
-                (Sx, Sy),
-                m_ref, n_ref,
-                u0, v0,
-                slm_pitch,
+            phase_ref, amp_ref, reference_patch_center = (
+                calcUtils.make_centered_patch_ramp(
+                    P, Q,
+                    (Sx, Sy),
+                    u0, v0,
+                    slm_pitch,
+                )
             )
 
             self.showHologram(phase_ref, amp_ref)
@@ -1611,7 +1618,7 @@ class Server:
                         phase_ref,
                         img_ref,
                         "Wavefront calibration - reference patch",
-                        patch_center=((m_ref + 0.5) * Sx, (n_ref + 0.5) * Sy),
+                        patch_center=reference_patch_center,
                         roi=roi,
                     )
                     # roi = live.select_roi(img_ref.shape, roi)
@@ -1647,7 +1654,7 @@ class Server:
                             img_ref,
                             "Wavefront calibration - reference patch",
                             cam_com=com_ref,
-                            patch_center=((m_ref + 0.5) * Sx, (n_ref + 0.5) * Sy),
+                            patch_center=reference_patch_center,
                             cam_ref_com=com_ref,
                             roi=roi,
                         )
@@ -1690,6 +1697,7 @@ class Server:
                 "roi": np.asarray(roi),
                 "com_ref": com_ref,
                 "power_ref": power_ref,
+                "reference_patch_center": reference_patch_center,
                 "reference_exposure_us": reference_exposure_us,
                 "reference_exposure_valid": reference_exposure_valid,
                 "reference_peak_fraction": reference_peak_fraction,
@@ -2354,12 +2362,12 @@ class Server:
 
         
 
-        m_ref, n_ref = M // 2, N // 2
-
         for i in np.linspace(0.1, 0.3 , 11):
             u0, v0 =2000, 0
             print(f"u0: {u0}, v0: {v0}")
-            phase_ref, amp_ref = calcUtils.make_patch_ramp(P, Q, S, m_ref, n_ref, u0, v0, slm_pitch)
+            phase_ref, amp_ref, _ = calcUtils.make_centered_patch_ramp(
+                P, Q, S, u0, v0, slm_pitch
+            )
     
             self.showHologram(phase_ref, amp_ref)
             input("press to continue")
