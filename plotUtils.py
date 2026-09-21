@@ -679,7 +679,7 @@ def save_calibration_plots(data, log_directory, dpi=250):
             _plot_calibration_image(
                 axes[0, 1],
                 100 * peak_fraction,
-                "Raw peak level",
+                "Smoothed spot peak level",
                 "Full scale [%]",
                 "magma",
             )
@@ -739,7 +739,7 @@ def save_calibration_plots(data, log_directory, dpi=250):
             _plot_calibration_image(
                 axes[0, 1],
                 100 * peak_fraction,
-                "Gradient-scan raw peak level",
+                "Gradient-scan smoothed spot peak",
                 "Full scale [%]",
                 "magma",
             )

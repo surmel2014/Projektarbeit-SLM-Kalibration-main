@@ -15,6 +15,7 @@ from pathlib import Path
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import RectangleSelector
 from math import gcd
+from scipy.ndimage import gaussian_filter
 
 
 def _normalize_roi(roi, image_shape=None):
@@ -266,6 +267,7 @@ def _build_calibration_metadata(data, log_directory):
         "amplitude_exposure_factor",
         "amplitude_max_attempts",
         "amplitude_saturation_value",
+        "exposure_smoothing_sigma",
     )
     com_patch = np.asarray(data["com_patch"])
     valid_patches = np.all(np.isfinite(com_patch), axis=-1)
@@ -547,7 +549,16 @@ class LiveCalibrationView:
             self.set_roi(selected_roi["value"])
         return selected_roi["value"]
 
-    def update(self, holo=None, cam_img=None, title=None, cam_com=None, patch_center=None, cam_ref_com=None, roi = None):
+    def update(
+        self,
+        holo=None,
+        cam_img=None,
+        title=None,
+        cam_com=None,
+        patch_center=None,
+        cam_ref_com=None,
+        roi=None,
+    ):
         if holo is not None:
             slm_preview = np.mod(np.asarray(holo), 2 * np.pi)
             if self.slm_image is None:
@@ -576,17 +587,27 @@ class LiveCalibrationView:
 
         if cam_img is not None:
             cam_preview = np.asarray(cam_img)
+            finite_display = cam_preview[np.isfinite(cam_preview)]
+            if finite_display.size:
+                display_min = float(np.min(finite_display))
+                display_max = float(np.max(finite_display))
+                if display_max <= display_min:
+                    display_max = display_min + 1.0
+            else:
+                display_min, display_max = 0.0, 1.0
             if self.cam_image is None:
                 self.cam_image = self.ax_cam.imshow(
                     cam_preview,
                     cmap="nipy_spectral",
                     origin="lower",
                     extent=self.cam_extent,
+                    vmin=display_min,
+                    vmax=display_max,
                 )
                 self.fig.colorbar(self.cam_image, ax=self.ax_cam, fraction=0.046, pad=0.04)
             else:
                 self.cam_image.set_data(cam_preview)
-                self.cam_image.set_clim(float(np.nanmin(cam_preview)), float(np.nanmax(cam_preview)))
+                self.cam_image.set_clim(display_min, display_max)
 
         if cam_com is not None:
             if self.cam_com_marker is None:
@@ -1156,6 +1177,7 @@ class Server:
         amplitude_exposure_factor=4.0,
         amplitude_max_attempts=8,
         amplitude_saturation_value=None,
+        exposure_smoothing_sigma=2.0,
         ):
         """
         Wavefront-Kalibration mit gemessener lokaler 2x2-Jacobi-Matrix.
@@ -1247,6 +1269,8 @@ class Server:
             raise ValueError("amplitude_max_attempts must be greater than 0.")
         if amplitude_saturation_value is not None and amplitude_saturation_value <= 0:
             raise ValueError("amplitude_saturation_value must be greater than 0.")
+        if exposure_smoothing_sigma < 0:
+            raise ValueError("exposure_smoothing_sigma must be non-negative.")
 
         log_directory = self._active_calibration_log_directory
 
@@ -1356,6 +1380,97 @@ class Server:
                     saturation_value = self.CAM.get_saturation_value()
                 return 255.0 if saturation_value is None else float(saturation_value)
 
+            def _smoothed_spot_metrics(raw_crop, signal_crop=None):
+                """Measure exposure from a smoothed spot instead of one hot pixel."""
+                raw_crop = np.asarray(raw_crop, dtype=float)
+                if signal_crop is None:
+                    local_background = float(np.percentile(raw_crop, 10))
+                    signal_crop = np.clip(raw_crop - local_background, 0, None)
+                else:
+                    signal_crop = np.clip(
+                        np.asarray(signal_crop, dtype=float),
+                        0,
+                        None,
+                    )
+
+                smoothed_signal = gaussian_filter(
+                    signal_crop,
+                    sigma=exposure_smoothing_sigma,
+                )
+                peak_y, peak_x = np.unravel_index(
+                    np.argmax(smoothed_signal),
+                    smoothed_signal.shape,
+                )
+                core_radius = max(
+                    2,
+                    int(np.ceil(3 * exposure_smoothing_sigma)),
+                )
+                core_y0 = max(0, peak_y - core_radius)
+                core_y1 = min(raw_crop.shape[0], peak_y + core_radius + 1)
+                core_x0 = max(0, peak_x - core_radius)
+                core_x1 = min(raw_crop.shape[1], peak_x + core_radius + 1)
+                raw_core = raw_crop[core_y0:core_y1, core_x0:core_x1]
+
+                saturation_value = _camera_saturation_value()
+                signal_peak_fraction = float(
+                    smoothed_signal[peak_y, peak_x] / saturation_value
+                )
+                raw_peak_fraction = float(np.max(raw_core) / saturation_value)
+                saturated_core = raw_core >= 0.98 * saturation_value
+                saturation_fraction = float(np.mean(saturated_core))
+                if np.count_nonzero(saturated_core) < 3:
+                    saturation_fraction = 0.0
+                return (
+                    signal_peak_fraction,
+                    raw_peak_fraction,
+                    saturation_fraction,
+                )
+
+            def _next_adaptive_exposure(
+                actual_exposure,
+                signal_peak_fraction,
+                saturation_fraction,
+                dark_bound_us,
+                bright_bound_us,
+            ):
+                """Update an exposure bracket without oscillating between endpoints."""
+                too_bright = (
+                    saturation_fraction > 0.0
+                    or signal_peak_fraction > amplitude_target_high
+                )
+                if too_bright:
+                    bright_bound_us = (
+                        actual_exposure
+                        if bright_bound_us is None
+                        else min(bright_bound_us, actual_exposure)
+                    )
+                else:
+                    dark_bound_us = (
+                        actual_exposure
+                        if dark_bound_us is None
+                        else max(dark_bound_us, actual_exposure)
+                    )
+
+                if (
+                    dark_bound_us is not None
+                    and bright_bound_us is not None
+                    and dark_bound_us < bright_bound_us
+                ):
+                    next_exposure = np.sqrt(dark_bound_us * bright_bound_us)
+                elif too_bright:
+                    next_exposure = actual_exposure / amplitude_exposure_factor
+                else:
+                    next_exposure = actual_exposure * amplitude_exposure_factor
+
+                next_exposure = float(
+                    np.clip(
+                        next_exposure,
+                        amplitude_exposure_min_us,
+                        amplitude_exposure_max_us,
+                    )
+                )
+                return next_exposure, dark_bound_us, bright_bound_us
+
             def _capture_gradient_image(label, initial_exposure_us):
                 """Capture a spot image with ROI-controlled adaptive exposure."""
                 exposure_us = float(
@@ -1367,6 +1482,11 @@ class Server:
                 )
                 best_unsaturated = None
                 last_candidate = None
+                dark_bound_us = None
+                bright_bound_us = None
+                target_peak_fraction = 0.5 * (
+                    amplitude_target_low + amplitude_target_high
+                )
 
                 for attempt in range(amplitude_max_attempts):
                     actual_exposure = _set_camera_exposure(exposure_us)
@@ -1382,16 +1502,11 @@ class Server:
 
                     y0, y1, x0, x1 = roi
                     crop = image[y0:y1, x0:x1]
-                    saturation_value = _camera_saturation_value()
-                    raw_peak_fraction = float(np.max(crop) / saturation_value)
-                    local_background = float(np.percentile(crop, 10))
-                    signal_peak_fraction = float(
-                        max(np.max(crop) - local_background, 0.0)
-                        / saturation_value
-                    )
-                    saturation_fraction = float(
-                        np.mean(crop >= 0.98 * saturation_value)
-                    )
+                    (
+                        signal_peak_fraction,
+                        raw_peak_fraction,
+                        saturation_fraction,
+                    ) = _smoothed_spot_metrics(crop)
                     candidate = {
                         "image": image,
                         "exposure_us": actual_exposure,
@@ -1401,17 +1516,19 @@ class Server:
                     }
                     last_candidate = candidate
                     is_unsaturated = saturation_fraction == 0.0
+                    candidate_distance = abs(
+                        signal_peak_fraction - target_peak_fraction
+                    )
                     if is_unsaturated and (
                         best_unsaturated is None
-                        or signal_peak_fraction
-                        > best_unsaturated["signal_peak_fraction"]
+                        or candidate_distance < best_unsaturated["distance"]
                     ):
-                        best_unsaturated = candidate
+                        best_unsaturated = {**candidate, "distance": candidate_distance}
 
                     print(
                         f"Gradient {label} exposure attempt {attempt + 1}: "
                         f"exposure={actual_exposure:.1f} us, "
-                        f"signal peak={100 * signal_peak_fraction:.1f}%, "
+                        f"smoothed spot peak={100 * signal_peak_fraction:.1f}%, "
                         f"saturated pixels={100 * saturation_fraction:.4f}%"
                     )
 
@@ -1423,19 +1540,17 @@ class Server:
                         candidate["valid"] = True
                         return candidate
 
-                    if (
-                        not is_unsaturated
-                        or raw_peak_fraction > amplitude_target_high
-                    ):
-                        next_exposure = max(
-                            amplitude_exposure_min_us,
-                            actual_exposure / amplitude_exposure_factor,
-                        )
-                    else:
-                        next_exposure = min(
-                            amplitude_exposure_max_us,
-                            actual_exposure * amplitude_exposure_factor,
-                        )
+                    (
+                        next_exposure,
+                        dark_bound_us,
+                        bright_bound_us,
+                    ) = _next_adaptive_exposure(
+                        actual_exposure,
+                        signal_peak_fraction,
+                        saturation_fraction,
+                        dark_bound_us,
+                        bright_bound_us,
+                    )
 
                     if np.isclose(next_exposure, actual_exposure):
                         break
@@ -1443,6 +1558,7 @@ class Server:
 
                 selected = best_unsaturated or last_candidate
                 if selected is not None:
+                    selected.pop("distance", None)
                     selected["valid"] = False
                 return selected
 
@@ -1475,7 +1591,7 @@ class Server:
                     reference_exposure_us = reference_measurement["exposure_us"]
                     reference_exposure_valid = reference_measurement["valid"]
                     reference_peak_fraction = reference_measurement[
-                        "raw_peak_fraction"
+                        "signal_peak_fraction"
                     ]
                     reference_saturation_fraction = reference_measurement[
                         "saturation_fraction"
@@ -1483,6 +1599,12 @@ class Server:
                 else:
                     img_ref = self.getSettledCamImg(settle_s, discard_frames)
                 img_ref = np.clip(img_ref, 0, None)
+
+                if adaptive_gradient_exposure and not reference_exposure_valid:
+                    raise RuntimeError(
+                        "No reliably exposed reference spot was found in the ROI. "
+                        "Check the ROI, exposure limits, or smoothing sigma."
+                    )
                 
                 if live is not None:
                     live.update(
@@ -1591,6 +1713,7 @@ class Server:
                     if amplitude_saturation_value is None
                     else float(amplitude_saturation_value)
                 ),
+                "exposure_smoothing_sigma": exposure_smoothing_sigma,
                 "focal_length": focal_length,
                 "wavelength": self.waveLength,
                 "cam_pitch": self.CAM.pitch,
@@ -1638,10 +1761,19 @@ class Server:
 
                 if adaptive_gradient_exposure:
                     patch_exposure = gradient_exposure_us[n, m]
+                    exposure_spot_valid = True
                     if not np.isfinite(patch_exposure):
+                        previous_exposures = gradient_exposure_us[
+                            np.isfinite(gradient_exposure_us)
+                        ]
+                        initial_patch_exposure = (
+                            previous_exposures[-1]
+                            if previous_exposures.size
+                            else reference_exposure_us
+                        )
                         gradient_measurement = _capture_gradient_image(
                             f"patch ({m},{n}) initial",
-                            reference_exposure_us,
+                            initial_patch_exposure,
                         )
                         img = gradient_measurement["image"]
                         measurement_exposure_us = gradient_measurement[
@@ -1649,7 +1781,7 @@ class Server:
                         ]
                         gradient_exposure_us[n, m] = measurement_exposure_us
                         gradient_peak_fraction[n, m] = gradient_measurement[
-                            "raw_peak_fraction"
+                            "signal_peak_fraction"
                         ]
                         gradient_saturation_fraction[n, m] = gradient_measurement[
                             "saturation_fraction"
@@ -1657,6 +1789,7 @@ class Server:
                         gradient_exposure_valid[n, m] = gradient_measurement[
                             "valid"
                         ]
+                        exposure_spot_valid = gradient_measurement["valid"]
                     else:
                         measurement_exposure_us = _set_camera_exposure(
                             patch_exposure
@@ -1668,9 +1801,16 @@ class Server:
                 else:
                     img = self.getSettledCamImg(settle_s, discard_frames)
                     measurement_exposure_us = old_integration_time
+                    exposure_spot_valid = True
                 img -= thresh_zerothorder
                 img = np.clip(img, 0, None)
-                com, power_raw = calcUtils.spot_com_and_power(img, roi)
+                if exposure_spot_valid:
+                    com, power_raw = calcUtils.spot_com_and_power(img, roi)
+                else:
+                    print(
+                        f"Patch ({m},{n}): no reliably exposed spot found in ROI."
+                    )
+                    com, power_raw = None, 0.0
                 power = (
                     power_raw / measurement_exposure_us
                     if adaptive_gradient_exposure
@@ -1689,6 +1829,7 @@ class Server:
                             f"Wavefront calibration - patch ({m}, {n}) {title_suffix}",
                             cam_com=com,
                             patch_center=((m + 0.5) * Sx, (n + 0.5) * Sy),
+                            roi=roi,
                         )
                 delta_px = None if com is None else com - com_ref
                 return delta_px, power, com
@@ -1734,15 +1875,26 @@ class Server:
                 if useCorrection:
                     phase = (phase + correctionPhase) % (2 * np.pi)
 
+                patch_gradient_exposure = gradient_exposure_us[n, m]
+                initial_amplitude_exposure = (
+                    patch_gradient_exposure
+                    if np.isfinite(patch_gradient_exposure)
+                    else old_integration_time
+                )
                 exposure_us = float(
                     np.clip(
-                        old_integration_time,
+                        initial_amplitude_exposure,
                         amplitude_exposure_min_us,
                         amplitude_exposure_max_us,
                     )
                 )
                 best_unsaturated = None
                 selected = None
+                dark_bound_us = None
+                bright_bound_us = None
+                target_peak_fraction = 0.5 * (
+                    amplitude_target_low + amplitude_target_high
+                )
 
                 try:
                     for attempt in range(amplitude_max_attempts):
@@ -1775,16 +1927,13 @@ class Server:
                         raw_crop = raw_image[y0:y1, x0:x1]
                         corrected_crop = corrected_image[y0:y1, x0:x1]
 
-                        saturation_value = _camera_saturation_value()
-
-                        raw_peak_fraction = float(
-                            np.max(raw_crop) / saturation_value
-                        )
-                        signal_peak_fraction = float(
-                            np.max(corrected_crop) / saturation_value
-                        )
-                        saturation_fraction = float(
-                            np.mean(raw_crop >= 0.98 * saturation_value)
+                        (
+                            signal_peak_fraction,
+                            raw_peak_fraction,
+                            saturation_fraction,
+                        ) = _smoothed_spot_metrics(
+                            raw_crop,
+                            corrected_crop,
                         )
                         _, raw_power = calcUtils.spot_com_and_power(
                             corrected_image,
@@ -1796,24 +1945,30 @@ class Server:
                             "power_raw": float(raw_power),
                             "power_normalized": float(raw_power / actual_exposure),
                             "exposure_us": actual_exposure,
-                            "peak_fraction": raw_peak_fraction,
+                            "peak_fraction": signal_peak_fraction,
+                            "raw_peak_fraction": raw_peak_fraction,
                             "signal_peak_fraction": signal_peak_fraction,
                             "saturation_fraction": saturation_fraction,
                             "image": corrected_image,
                             "phase": phase,
                         }
                         is_unsaturated = saturation_fraction == 0.0
+                        candidate_distance = abs(
+                            signal_peak_fraction - target_peak_fraction
+                        )
                         if is_unsaturated and (
                             best_unsaturated is None
-                            or signal_peak_fraction
-                            > best_unsaturated["signal_peak_fraction"]
+                            or candidate_distance < best_unsaturated["distance"]
                         ):
-                            best_unsaturated = candidate
+                            best_unsaturated = {
+                                **candidate,
+                                "distance": candidate_distance,
+                            }
 
                         print(
                             f"Amplitude patch ({m},{n}) attempt {attempt + 1}: "
                             f"exposure={actual_exposure:.1f} us, "
-                            f"signal peak={100 * signal_peak_fraction:.1f}%, "
+                            f"smoothed spot peak={100 * signal_peak_fraction:.1f}%, "
                             f"saturated pixels={100 * saturation_fraction:.4f}%"
                         )
 
@@ -1826,25 +1981,24 @@ class Server:
                             selected = candidate
                             break
 
-                        if (
-                            not is_unsaturated
-                            or raw_peak_fraction > amplitude_target_high
-                        ):
-                            next_exposure = max(
-                                amplitude_exposure_min_us,
-                                actual_exposure / amplitude_exposure_factor,
-                            )
-                        else:
-                            next_exposure = min(
-                                amplitude_exposure_max_us,
-                                actual_exposure * amplitude_exposure_factor,
-                            )
+                        (
+                            next_exposure,
+                            dark_bound_us,
+                            bright_bound_us,
+                        ) = _next_adaptive_exposure(
+                            actual_exposure,
+                            signal_peak_fraction,
+                            saturation_fraction,
+                            dark_bound_us,
+                            bright_bound_us,
+                        )
 
                         if np.isclose(next_exposure, actual_exposure):
                             break
                         exposure_us = next_exposure
 
                     if selected is None and best_unsaturated is not None:
+                        best_unsaturated.pop("distance", None)
                         best_unsaturated["valid"] = False
                         selected = best_unsaturated
                     return selected
